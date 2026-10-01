@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torchaudio.functional.functional import _hz_to_mel, _mel_to_hz
 
-from vocos.spectral_ops import IMDCT, ISTFT
+from vocos.spectral_ops import CausalISTFT, IMDCT, ISTFT
 from vocos.modules import symexp
 
 
@@ -67,6 +67,27 @@ class ISTFTHead(FourierHead):
         S = mag * (x + 1j * y)
         audio = self.istft(S)
         return audio
+
+
+class CausalISTFTHead(FourierHead):
+    """Causal Vocos head that emits one waveform hop per conditioning frame."""
+
+    def __init__(self, dim: int, n_fft: int, hop_length: int):
+        super().__init__()
+        self.out = nn.Linear(dim, n_fft + 2)
+        self.istft = CausalISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft)
+
+    def _to_spectrum(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.out(x).transpose(1, 2)
+        magnitude, phase = x.chunk(2, dim=1)
+        magnitude = torch.exp(magnitude).clamp(max=1e2)
+        return magnitude * (torch.cos(phase) + 1j * torch.sin(phase))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.istft(self._to_spectrum(x))
+
+    def forward_stream(self, x: torch.Tensor, state=None):
+        return self.istft.forward_stream(self._to_spectrum(x), state)
 
 
 class IMDCTSymExpHead(FourierHead):

@@ -60,6 +60,90 @@ class ConvNeXtBlock(nn.Module):
         return x
 
 
+class CausalConv1d(nn.Module):
+    """A Conv1d with left-only padding and an explicit streaming cache.
+
+    ``forward`` is useful while training on complete sequences. ``forward_stream``
+    accepts arbitrary-length chunks and produces exactly the same values while
+    retaining only the receptive-field history needed by the next chunk.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        if kwargs.get("padding", 0) != 0:
+            raise ValueError("CausalConv1d manages padding internally; pass padding=0.")
+        kwargs["padding"] = 0
+        self.conv = nn.Conv1d(*args, **kwargs)
+        self.context = (self.conv.kernel_size[0] - 1) * self.conv.dilation[0]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(torch.nn.functional.pad(x, (self.context, 0)))
+
+    def forward_stream(
+        self, x: torch.Tensor, state: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if state is None or state.shape[:2] != x.shape[:2]:
+            state = x.new_zeros(x.size(0), x.size(1), self.context)
+        x_with_history = torch.cat((state, x), dim=-1)
+        y = self.conv(x_with_history)
+        next_state = x_with_history[..., -self.context :] if self.context else state
+        return y, next_state
+
+
+class CausalConvNeXtBlock(nn.Module):
+    """ConvNeXt block whose only temporal operation is strictly causal."""
+
+    def __init__(
+        self,
+        dim: int,
+        intermediate_dim: int,
+        layer_scale_init_value: float,
+        adanorm_num_embeddings: Optional[int] = None,
+    ):
+        super().__init__()
+        self.dwconv = CausalConv1d(dim, dim, kernel_size=7, groups=dim)
+        self.adanorm = adanorm_num_embeddings is not None
+        if adanorm_num_embeddings:
+            self.norm = AdaLayerNorm(adanorm_num_embeddings, dim, eps=1e-6)
+        else:
+            self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, intermediate_dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(intermediate_dim, dim)
+        self.gamma = (
+            nn.Parameter(layer_scale_init_value * torch.ones(dim), requires_grad=True)
+            if layer_scale_init_value > 0
+            else None
+        )
+
+    def _forward(self, x: torch.Tensor, cond_embedding_id: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x.transpose(1, 2)
+        if self.adanorm:
+            assert cond_embedding_id is not None
+            x = self.norm(x, cond_embedding_id)
+        else:
+            x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        return x.transpose(1, 2)
+
+    def forward(self, x: torch.Tensor, cond_embedding_id: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return x + self._forward(self.dwconv(x), cond_embedding_id)
+
+    def forward_stream(
+        self,
+        x: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+        cond_embedding_id: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual = x
+        x, next_state = self.dwconv.forward_stream(x, state)
+        return residual + self._forward(x, cond_embedding_id), next_state
+
+
 class AdaLayerNorm(nn.Module):
     """
     Adaptive Layer Normalization module with learnable embeddings per `num_embeddings` classes

@@ -114,6 +114,20 @@ class Vocos(nn.Module):
         return audio_output
 
     @torch.inference_mode()
+    def decode_stream(self, features_input: torch.Tensor, state: Optional[Dict[str, Any]] = None, **kwargs: Any):
+        """Decode one causal feature chunk and return ``(audio, next_state)``.
+
+        This is available only for checkpoints built with
+        ``CausalVocosBackbone`` and ``CausalISTFTHead``.
+        """
+        if not hasattr(self.backbone, "forward_stream") or not hasattr(self.head, "forward_stream"):
+            raise TypeError("decode_stream requires CausalVocosBackbone and CausalISTFTHead.")
+        state = {} if state is None else state
+        x, backbone_state = self.backbone.forward_stream(features_input, state.get("backbone"), **kwargs)
+        audio_output, head_state = self.head.forward_stream(x, state.get("head"))
+        return audio_output, {"backbone": backbone_state, "head": head_state}
+
+    @torch.inference_mode()
     def codes_to_features(self, codes: torch.Tensor) -> torch.Tensor:
         """
         Transforms an input sequence of discrete tokens (codes) into feature embeddings using the feature extractor's

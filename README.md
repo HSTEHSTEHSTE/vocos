@@ -124,6 +124,51 @@ The checked-in training code and configs target PyTorch Lightning 1.8.6. Refer t
 [PyTorch Lightning 1.8.6 documentation](https://pytorch-lightning.readthedocs.io/en/1.8.6/) for details about
 customizing that training pipeline.
 
+### Multi-GPU training
+
+All training configurations use Lightning DDP and accept a numeric GPU count. For
+two GPUs on one node, run:
+
+```bash
+python train.py -c configs/wavlm-causal.yaml --trainer.devices=2 --trainer.num_nodes=1
+```
+
+The configured batch sizes are per GPU, so this doubles the effective global batch
+size. [train_vocos_causal_2xa100.sbatch](slurm/train_vocos_causal_2xa100.sbatch)
+requests two A100s and launches the WavLM causal configuration with DDP. To use
+causal mel features instead, submit with `VOCOS_CONFIG=configs/vocos-causal.yaml`.
+The WavLM launcher supplies the LibriSpeech source and pre-extracted feature roots;
+when running manually, provide both roots and the train/validation filelists.
+
+### Causal mel Vocos
+
+`configs/vocos-causal.yaml` is the end-to-end causal training configuration:
+it uses left-padded mel frames (`padding: causal`), `CausalVocosBackbone`, and
+`CausalISTFTHead`. Each 256-sample frame is synthesized from conditioning
+available at that frame boundary, with no right padding or future decoder frames.
+Start it with `python train.py -c configs/vocos-causal.yaml` after filling in the
+two filelist paths.
+
+### Causal WavLM-conditioned Vocos
+
+`configs/wavlm-causal.yaml` trains a 24 kHz causal decoder from pre-extracted,
+zero-look-ahead WavLM-Large layer-6 features. The dataset loads matching `.pt`
+files from the configured feature root rather than running a WavLM encoder during
+training. It uses `CausalVocosBackbone` and `CausalISTFTHead`, both of which expose
+a bounded-state streaming API:
+
+The Slurm preflight creates filelists for all LibriSpeech `train-*` splits (the
+960-hour training set) and `dev-clean` validation, then verifies every selected
+audio file has a matching pre-extracted feature tensor.
+
+```python
+audio_chunk, state = vocos.decode_stream(feature_chunk, state)
+```
+
+Feature chunks must have shape `(batch, 1024, frames)`, and each frame produces 480
+audio samples. The configured extractor uses a 100-frame left context and no future
+frames, so the conditioning and decoder are both zero-look-ahead.
+
 ## Contributing
 
 Bug reports, documentation improvements, and focused fixes are welcome. Please read

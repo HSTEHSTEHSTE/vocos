@@ -2,6 +2,7 @@ import numpy as np
 import scipy.signal
 import torch
 from torch import nn, view_as_real, view_as_complex
+from typing import Optional
 
 
 class ISTFT(nn.Module):
@@ -73,6 +74,56 @@ class ISTFT(nn.Module):
         y = y / window_envelope
 
         return y
+
+
+class CausalISTFT(nn.Module):
+    """Left-aligned, overlap-add ISTFT with a bounded streaming state.
+
+    Each input spectral frame emits exactly one hop of audio. A Hamming window is
+    used instead of Hann so the first sample is well defined without future
+    frames; normalization by the accumulated window envelope preserves OLA gain.
+    """
+
+    def __init__(self, n_fft: int, hop_length: int, win_length: Optional[int] = None):
+        super().__init__()
+        if hop_length > n_fft:
+            raise ValueError("hop_length must not exceed n_fft for overlap-add synthesis.")
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length or n_fft
+        if self.win_length != self.n_fft:
+            raise ValueError("CausalISTFT currently requires win_length == n_fft.")
+        self.register_buffer("window", torch.hamming_window(self.win_length, periodic=False))
+
+    def forward(self, spec: torch.Tensor) -> torch.Tensor:
+        audio, _ = self.forward_stream(spec)
+        return audio
+
+    def forward_stream(self, spec: torch.Tensor, state=None):
+        if spec.dim() != 3:
+            raise ValueError("Expected complex spectrum of shape (B, N, T).")
+        if not torch.is_complex(spec):
+            raise ValueError("CausalISTFT expects a complex spectrum.")
+        batch_size = spec.size(0)
+        if state is None:
+            state = {}
+        audio_state = state.get("audio")
+        envelope_state = state.get("envelope")
+        if audio_state is None or audio_state.size(0) != batch_size:
+            audio_state = spec.real.new_zeros(batch_size, self.n_fft)
+            envelope_state = spec.real.new_zeros(batch_size, self.n_fft)
+
+        frames = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
+        frames = frames * self.window[None, :, None]
+        window_sq = self.window.square()[None, :].expand(batch_size, -1)
+        chunks = []
+        for index in range(frames.size(-1)):
+            audio_state = audio_state + frames[..., index]
+            envelope_state = envelope_state + window_sq
+            chunks.append(audio_state[..., : self.hop_length] / envelope_state[..., : self.hop_length].clamp_min(1e-8))
+            audio_state = torch.nn.functional.pad(audio_state[..., self.hop_length :], (0, self.hop_length))
+            envelope_state = torch.nn.functional.pad(envelope_state[..., self.hop_length :], (0, self.hop_length))
+        return torch.cat(chunks, dim=-1), {"audio": audio_state, "envelope": envelope_state}
 
 
 class MDCT(nn.Module):

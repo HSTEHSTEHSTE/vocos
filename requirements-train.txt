@@ -1,4 +1,6 @@
 pytorch_lightning==1.8.6
+tensorboard==2.21.0
+wandb==0.30.0
 jsonargparse[signatures]
 transformers
 matplotlib

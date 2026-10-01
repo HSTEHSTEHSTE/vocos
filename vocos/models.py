@@ -1,10 +1,10 @@
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.nn.utils import weight_norm
 
-from vocos.modules import ConvNeXtBlock, ResBlock1, AdaLayerNorm
+from vocos.modules import AdaLayerNorm, CausalConv1d, CausalConvNeXtBlock, ConvNeXtBlock, ResBlock1
 
 
 class Backbone(nn.Module):
@@ -87,6 +87,82 @@ class VocosBackbone(Backbone):
             x = conv_block(x, cond_embedding_id=bandwidth_id)
         x = self.final_layer_norm(x.transpose(1, 2))
         return x
+
+
+class CausalVocosBackbone(Backbone):
+    """A strictly causal, stateful ConvNeXt backbone for streaming Vocos.
+
+    The model uses no right padding. ``forward_stream`` retains the convolution
+    history for each layer, so concatenating chunk outputs matches ``forward``.
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        dim: int,
+        intermediate_dim: int,
+        num_layers: int,
+        layer_scale_init_value: Optional[float] = None,
+        adanorm_num_embeddings: Optional[int] = None,
+    ):
+        super().__init__()
+        self.input_channels = input_channels
+        self.embed = CausalConv1d(input_channels, dim, kernel_size=7)
+        self.adanorm = adanorm_num_embeddings is not None
+        if adanorm_num_embeddings:
+            self.norm = AdaLayerNorm(adanorm_num_embeddings, dim, eps=1e-6)
+        else:
+            self.norm = nn.LayerNorm(dim, eps=1e-6)
+        layer_scale_init_value = layer_scale_init_value or 1 / num_layers
+        self.convnext = nn.ModuleList(
+            [
+                CausalConvNeXtBlock(
+                    dim=dim,
+                    intermediate_dim=intermediate_dim,
+                    layer_scale_init_value=layer_scale_init_value,
+                    adanorm_num_embeddings=adanorm_num_embeddings,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_layer_norm = nn.LayerNorm(dim, eps=1e-6)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, (nn.Conv1d, nn.Linear)):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def _post_embed(self, x: torch.Tensor, bandwidth_id: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.adanorm:
+            assert bandwidth_id is not None
+            return self.norm(x.transpose(1, 2), cond_embedding_id=bandwidth_id).transpose(1, 2)
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        bandwidth_id = kwargs.get("bandwidth_id")
+        x = self._post_embed(self.embed(x), bandwidth_id)
+        for block in self.convnext:
+            x = block(x, cond_embedding_id=bandwidth_id)
+        return self.final_layer_norm(x.transpose(1, 2))
+
+    def forward_stream(
+        self, x: torch.Tensor, state: Optional[Dict[str, object]] = None, **kwargs
+    ) -> Tuple[torch.Tensor, Dict[str, object]]:
+        """Decode one feature chunk and return its output plus the next state."""
+        bandwidth_id = kwargs.get("bandwidth_id")
+        state = {} if state is None else state
+        x, embed_state = self.embed.forward_stream(x, state.get("embed"))
+        x = self._post_embed(x, bandwidth_id)
+
+        block_states = state.get("blocks", [None] * len(self.convnext))
+        next_block_states = []
+        for block, block_state in zip(self.convnext, block_states):
+            x, block_state = block.forward_stream(x, block_state, cond_embedding_id=bandwidth_id)
+            next_block_states.append(block_state)
+        return self.final_layer_norm(x.transpose(1, 2)), {"embed": embed_state, "blocks": next_block_states}
 
 
 class VocosResNetBackbone(Backbone):

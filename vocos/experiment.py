@@ -32,6 +32,8 @@ class VocosExp(pl.LightningModule):
         evaluate_utmos: bool = False,
         evaluate_pesq: bool = False,
         evaluate_periodicty: bool = False,
+        generator_learning_rate: float | None = None,
+        discriminator_learning_rate: float | None = None,
     ):
         """
         Args:
@@ -67,6 +69,29 @@ class VocosExp(pl.LightningModule):
         self.train_discriminator = False
         self.base_mel_coeff = self.mel_loss_coeff = mel_loss_coeff
 
+    def _log_audio(self, key: str, audio: torch.Tensor) -> None:
+        """Log audio through either TensorBoard or Weights & Biases."""
+        audio_array = audio.detach().cpu().numpy()
+        experiment = self.logger.experiment
+        if hasattr(experiment, "add_audio"):
+            experiment.add_audio(key, audio_array, self.global_step, self.hparams.sample_rate)
+            return
+
+        import wandb
+
+        experiment.log({key: wandb.Audio(audio_array, sample_rate=self.hparams.sample_rate)}, step=self.global_step)
+
+    def _log_image(self, key: str, image: np.ndarray) -> None:
+        """Log an HWC image through either TensorBoard or Weights & Biases."""
+        experiment = self.logger.experiment
+        if hasattr(experiment, "add_image"):
+            experiment.add_image(key, image, self.global_step, dataformats="HWC")
+            return
+
+        import wandb
+
+        experiment.log({key: wandb.Image(image)}, step=self.global_step)
+
     def configure_optimizers(self):
         disc_params = [
             {"params": self.multiperioddisc.parameters()},
@@ -78,8 +103,18 @@ class VocosExp(pl.LightningModule):
             {"params": self.head.parameters()},
         ]
 
-        opt_disc = torch.optim.AdamW(disc_params, lr=self.hparams.initial_learning_rate, betas=(0.8, 0.9))
-        opt_gen = torch.optim.AdamW(gen_params, lr=self.hparams.initial_learning_rate, betas=(0.8, 0.9))
+        generator_learning_rate = (
+            self.hparams.initial_learning_rate
+            if self.hparams.generator_learning_rate is None
+            else self.hparams.generator_learning_rate
+        )
+        discriminator_learning_rate = (
+            self.hparams.initial_learning_rate
+            if self.hparams.discriminator_learning_rate is None
+            else self.hparams.discriminator_learning_rate
+        )
+        opt_disc = torch.optim.AdamW(disc_params, lr=discriminator_learning_rate, betas=(0.8, 0.9))
+        opt_gen = torch.optim.AdamW(gen_params, lr=generator_learning_rate, betas=(0.8, 0.9))
 
         max_steps = self.trainer.max_steps // 2  # Max steps per optimizer
         scheduler_disc = transformers.get_cosine_schedule_with_warmup(
@@ -94,19 +129,26 @@ class VocosExp(pl.LightningModule):
             [{"scheduler": scheduler_disc, "interval": "step"}, {"scheduler": scheduler_gen, "interval": "step"}],
         )
 
-    def forward(self, audio_input, **kwargs):
-        features = self.feature_extractor(audio_input, **kwargs)
+    @staticmethod
+    def _split_batch(batch):
+        if isinstance(batch, dict):
+            return batch["audio"], batch.get("features")
+        return batch, None
+
+    def forward(self, audio_input, precomputed_features=None, **kwargs):
+        feature_input = audio_input if precomputed_features is None else precomputed_features
+        features = self.feature_extractor(feature_input, sample_rate=self.hparams.sample_rate, **kwargs)
         x = self.backbone(features, **kwargs)
         audio_output = self.head(x)
         return audio_output
 
     def training_step(self, batch, batch_idx, optimizer_idx, **kwargs):
-        audio_input = batch
+        audio_input, precomputed_features = self._split_batch(batch)
 
         # train discriminator
         if optimizer_idx == 0 and self.train_discriminator:
             with torch.no_grad():
-                audio_hat = self(audio_input, **kwargs)
+                audio_hat = self(audio_input, precomputed_features=precomputed_features, **kwargs)
 
             real_score_mp, gen_score_mp, _, _ = self.multiperioddisc(y=audio_input, y_hat=audio_hat, **kwargs,)
             real_score_mrd, gen_score_mrd, _, _ = self.multiresddisc(y=audio_input, y_hat=audio_hat, **kwargs,)
@@ -127,7 +169,7 @@ class VocosExp(pl.LightningModule):
 
         # train generator
         if optimizer_idx == 1:
-            audio_hat = self(audio_input, **kwargs)
+            audio_hat = self(audio_input, precomputed_features=precomputed_features, **kwargs)
             if self.train_discriminator:
                 _, gen_score_mp, fmap_rs_mp, fmap_gs_mp = self.multiperioddisc(
                     y=audio_input, y_hat=audio_hat, **kwargs,
@@ -163,27 +205,13 @@ class VocosExp(pl.LightningModule):
             self.log("generator/mel_loss", mel_loss)
 
             if self.global_step % 1000 == 0 and self.global_rank == 0:
-                self.logger.experiment.add_audio(
-                    "train/audio_in", audio_input[0].data.cpu(), self.global_step, self.hparams.sample_rate
-                )
-                self.logger.experiment.add_audio(
-                    "train/audio_pred", audio_hat[0].data.cpu(), self.global_step, self.hparams.sample_rate
-                )
+                self._log_audio("train/audio_in", audio_input[0])
+                self._log_audio("train/audio_pred", audio_hat[0])
                 with torch.no_grad():
                     mel = safe_log(self.melspec_loss.mel_spec(audio_input[0]))
                     mel_hat = safe_log(self.melspec_loss.mel_spec(audio_hat[0]))
-                self.logger.experiment.add_image(
-                    "train/mel_target",
-                    plot_spectrogram_to_numpy(mel.data.cpu().numpy()),
-                    self.global_step,
-                    dataformats="HWC",
-                )
-                self.logger.experiment.add_image(
-                    "train/mel_pred",
-                    plot_spectrogram_to_numpy(mel_hat.data.cpu().numpy()),
-                    self.global_step,
-                    dataformats="HWC",
-                )
+                self._log_image("train/mel_target", plot_spectrogram_to_numpy(mel.data.cpu().numpy()))
+                self._log_image("train/mel_pred", plot_spectrogram_to_numpy(mel_hat.data.cpu().numpy()))
 
             return loss
 
@@ -195,8 +223,8 @@ class VocosExp(pl.LightningModule):
                 self.utmos_model = UTMOSScore(device=self.device)
 
     def validation_step(self, batch, batch_idx, **kwargs):
-        audio_input = batch
-        audio_hat = self(audio_input, **kwargs)
+        audio_input, precomputed_features = self._split_batch(batch)
+        audio_hat = self(audio_input, precomputed_features=precomputed_features, **kwargs)
 
         audio_16_khz = torchaudio.functional.resample(audio_input, orig_freq=self.hparams.sample_rate, new_freq=16000)
         audio_hat_16khz = torchaudio.functional.resample(audio_hat, orig_freq=self.hparams.sample_rate, new_freq=16000)
@@ -242,26 +270,12 @@ class VocosExp(pl.LightningModule):
     def validation_epoch_end(self, outputs):
         if self.global_rank == 0:
             *_, audio_in, audio_pred = outputs[0].values()
-            self.logger.experiment.add_audio(
-                "val_in", audio_in.data.cpu().numpy(), self.global_step, self.hparams.sample_rate
-            )
-            self.logger.experiment.add_audio(
-                "val_pred", audio_pred.data.cpu().numpy(), self.global_step, self.hparams.sample_rate
-            )
+            self._log_audio("val_in", audio_in)
+            self._log_audio("val_pred", audio_pred)
             mel_target = safe_log(self.melspec_loss.mel_spec(audio_in))
             mel_hat = safe_log(self.melspec_loss.mel_spec(audio_pred))
-            self.logger.experiment.add_image(
-                "val_mel_target",
-                plot_spectrogram_to_numpy(mel_target.data.cpu().numpy()),
-                self.global_step,
-                dataformats="HWC",
-            )
-            self.logger.experiment.add_image(
-                "val_mel_hat",
-                plot_spectrogram_to_numpy(mel_hat.data.cpu().numpy()),
-                self.global_step,
-                dataformats="HWC",
-            )
+            self._log_image("val_mel_target", plot_spectrogram_to_numpy(mel_target.data.cpu().numpy()))
+            self._log_image("val_mel_hat", plot_spectrogram_to_numpy(mel_hat.data.cpu().numpy()))
         avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
         mel_loss = torch.stack([x["mel_loss"] for x in outputs]).mean()
         utmos_score = torch.stack([x["utmos_score"] for x in outputs]).mean()
@@ -364,8 +378,6 @@ class VocosEncodecExp(VocosExp):
             # Resynthesis with encodec for reference
             self.feature_extractor.encodec.set_target_bandwidth(self.feature_extractor.bandwidths[0])
             encodec_audio = self.feature_extractor.encodec(audio_in[None, None, :])
-            self.logger.experiment.add_audio(
-                "encodec", encodec_audio[0, 0].data.cpu().numpy(), self.global_step, self.hparams.sample_rate,
-            )
+            self._log_audio("encodec", encodec_audio[0, 0])
 
         super().validation_epoch_end(outputs)
