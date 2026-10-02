@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 import torchaudio
 import yaml
@@ -31,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature", type=Path, help="Override the feature tensor paired with --audio.")
     parser.add_argument("--feature-root", type=Path, default=DEFAULT_FEATURE_ROOT)
     parser.add_argument("--feature-source-root", type=Path, default=DEFAULT_SOURCE_ROOT)
+    parser.add_argument(
+        "--speaker-transform-dir",
+        type=Path,
+        help="Optional LinearVC speaker-transform directory. Lifts 75-D content features to the model's 1024-D input.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ARTIFACT_ROOT / "inference")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and checkpoint loading without synthesis.")
@@ -93,6 +99,22 @@ def load_feature_tensor(feature_path: Path) -> torch.Tensor:
     return features.float()
 
 
+def lift_features_for_librispeech_speaker(features: torch.Tensor, audio_path: Path, transform_dir: Path) -> torch.Tensor:
+    speaker_id = audio_path.parent.parent.name
+    if not speaker_id.isdigit():
+        raise ValueError(f"Cannot infer a LibriSpeech speaker ID from {audio_path}")
+    speakers_dir = transform_dir / "speakers"
+    transform_path = (speakers_dir if speakers_dir.is_dir() else transform_dir) / f"{speaker_id}.npy"
+    if not transform_path.is_file():
+        raise FileNotFoundError(f"Speaker transform is missing: {transform_path}")
+    transform = torch.from_numpy(np.load(transform_path)).float().contiguous()
+    if transform.ndim != 2 or transform.size(0) != features.size(1):
+        raise ValueError(
+            f"Transform {transform_path} must have shape ({features.size(1)}, output_dim), got {tuple(transform.shape)}."
+        )
+    return features @ transform
+
+
 def align_features(features: torch.Tensor, target_frames: int) -> torch.Tensor:
     if features.size(0) == 0:
         raise ValueError("Feature tensor has no frames.")
@@ -126,6 +148,8 @@ def main() -> None:
         source_audio = torchaudio.functional.resample(source_audio, source_rate, sample_rate)
 
     features = load_feature_tensor(feature_path)
+    if args.speaker_transform_dir is not None:
+        features = lift_features_for_librispeech_speaker(features, audio_path, args.speaker_transform_dir)
     target_frames = math.ceil(source_audio.size(-1) / feature_hop_length)
     features = align_features(features, target_frames)
     model = instantiate_model(config, checkpoint_path, device)

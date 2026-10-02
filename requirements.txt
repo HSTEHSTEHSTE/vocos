@@ -5,4 +5,5 @@ scipy
 einops
 pyyaml
 huggingface_hub
+speechbrain
 encodec==0.1.1

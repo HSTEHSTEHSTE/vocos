@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torchaudio
 
@@ -8,7 +9,7 @@ from vocos.feature_extractors import PrecomputedWavLMFeatures
 def _write_example_pair(tmp_path, frames=49, channels=4):
     audio_root = tmp_path / "audio"
     feature_root = tmp_path / "features"
-    audio_path = audio_root / "train-clean-100" / "1" / "1-1.flac"
+    audio_path = audio_root / "train-clean-100" / "1" / "1" / "1-1.flac"
     audio_path.parent.mkdir(parents=True)
     torchaudio.save(audio_path, torch.zeros(1, 16_000), 16_000)
     feature_path = (feature_root / audio_path.relative_to(audio_root)).with_suffix(".pt")
@@ -49,3 +50,32 @@ def test_precomputed_wavlm_feature_extractor_is_identity():
     output = extractor(features)
 
     assert output is features
+
+
+def test_dataset_lifts_75d_content_features_with_the_matching_speaker_transform(tmp_path):
+    audio_root, feature_root, filelist, features = _write_example_pair(tmp_path, frames=49, channels=3)
+    transform_root = tmp_path / "speaker-transforms"
+    (transform_root / "speakers").mkdir(parents=True)
+    transform = np.arange(15, dtype=np.float32).reshape(3, 5)
+    np.save(transform_root / "speakers" / "1.npy", transform)
+    config = DataConfig(
+        filelist_path=str(filelist),
+        sampling_rate=24_000,
+        num_samples=24_000,
+        batch_size=1,
+        num_workers=0,
+        feature_root=str(feature_root),
+        feature_source_root=str(audio_root),
+        feature_hop_length=480,
+        feature_dim=3,
+        use_speaker_transform=True,
+        speaker_transform_dir=str(transform_root),
+        speaker_transform_output_dim=5,
+    )
+
+    batch = VocosDataset(config, train=False)[0]
+    expected = features.float() @ torch.from_numpy(transform)
+
+    assert batch["features"].shape == (5, 50)
+    torch.testing.assert_close(batch["features"][:, :-1], expected.transpose(0, 1))
+    torch.testing.assert_close(batch["features"][:, -1], expected[-1])

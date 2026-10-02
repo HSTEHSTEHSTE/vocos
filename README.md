@@ -169,6 +169,26 @@ Feature chunks must have shape `(batch, 1024, frames)`, and each frame produces 
 audio samples. The configured extractor uses a 100-frame left context and no future
 frames, so the conditioning and decoder are both zero-look-ahead.
 
+#### LinearVC 75-D content-feature toggle
+
+Set `VOCOS_FEATURE_MODE=linearvc_content75` when submitting the causal WavLM
+launcher to read the 75-D UTXSS content tensors produced by LinearVC instead of
+the direct 1024-D WavLM tensors. The dataset derives the LibriSpeech speaker ID
+from each audio path and applies that speaker's LinearVC `75 x 1024` matrix before
+batching, so the Vocos feature extractor, backbone, and head remain exactly the
+same 1024-D architecture. The launcher defaults to the converted-feature root and
+the matching speaker-transform directory; both can be overridden with
+`WAVLM_FEATURE_ROOT` and `VOCOS_SPEAKER_TRANSFORM_DIR`.
+
+```bash
+VOCOS_FEATURE_MODE=linearvc_content75 \
+sbatch slurm/train_vocos_causal_2xa100.sbatch
+```
+
+The preflight verifies every selected 75-D tensor and that each LibriSpeech speaker
+has a matrix in `speakers/<speaker-id>.npy`. It also rejects mismatched LinearVC
+projection provenance when both artifact manifests are present.
+
 ## Contributing
 
 Bug reports, documentation improvements, and focused fixes are welcome. Please read

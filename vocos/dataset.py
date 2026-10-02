@@ -1,4 +1,6 @@
 import math
+import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -23,6 +25,10 @@ class DataConfig:
     feature_source_root: Optional[str] = None
     feature_hop_length: int = 480
     feature_dim: Optional[int] = None
+    use_speaker_transform: bool = False
+    speaker_transform_dir: Optional[str] = None
+    speaker_transform_output_dim: int = 1024
+    speaker_transform_cache_size: int = 64
 
 
 class VocosDataModule(LightningDataModule):
@@ -60,6 +66,21 @@ class VocosDataset(Dataset):
             raise ValueError("feature_hop_length must be positive.")
         self.feature_hop_length = cfg.feature_hop_length
         self.feature_dim = cfg.feature_dim
+        self.use_speaker_transform = cfg.use_speaker_transform
+        self.speaker_transform_output_dim = cfg.speaker_transform_output_dim
+        self.speaker_transform_cache_size = cfg.speaker_transform_cache_size
+        self._speaker_transform_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self.speaker_transform_dir = Path(cfg.speaker_transform_dir) if cfg.speaker_transform_dir else None
+        if self.use_speaker_transform:
+            if self.feature_root is None or self.feature_source_root is None or self.feature_dim is None:
+                raise ValueError("Speaker transforms require precomputed features with a declared source feature_dim.")
+            if self.speaker_transform_dir is None:
+                raise ValueError("speaker_transform_dir is required when use_speaker_transform is true.")
+            if not self.speaker_transform_dir.is_dir():
+                raise FileNotFoundError(f"Speaker-transform directory is missing: {self.speaker_transform_dir}")
+            if self.speaker_transform_cache_size <= 0:
+                raise ValueError("speaker_transform_cache_size must be positive.")
+            self._validate_speaker_transform_provenance()
 
     def __len__(self) -> int:
         return len(self.filelist)
@@ -71,6 +92,55 @@ class VocosDataset(Dataset):
         except ValueError as exc:
             raise ValueError(f"Audio path is outside feature_source_root: {audio_path}") from exc
         return (self.feature_root / relative_path).with_suffix(".pt")
+
+    def _validate_speaker_transform_provenance(self) -> None:
+        """Reject known-incompatible LinearVC projection/decoder artifacts."""
+        assert self.feature_root is not None and self.speaker_transform_dir is not None
+        conversion_manifest = self.feature_root / "conversion-provenance.json"
+        transform_manifest = self.speaker_transform_dir / "speaker-transform-provenance.json"
+        if not conversion_manifest.is_file() or not transform_manifest.is_file():
+            return
+        conversion_projection = json.loads(conversion_manifest.read_text()).get("projection_sha256")
+        transform_projection = json.loads(transform_manifest.read_text()).get("projection_sha256")
+        if conversion_projection != transform_projection:
+            raise ValueError(
+                "The 75-D feature conversion and speaker transforms use different content projections: "
+                f"{conversion_projection!r} != {transform_projection!r}."
+            )
+
+    @staticmethod
+    def _speaker_id(audio_path: Path) -> str:
+        # LibriSpeech paths are <split>/<speaker>/<chapter>/<utterance>.flac.
+        speaker_id = audio_path.parent.parent.name
+        if not speaker_id.isdigit():
+            raise ValueError(f"Cannot infer a LibriSpeech speaker ID from {audio_path}")
+        return speaker_id
+
+    def _speaker_transform_path(self, speaker_id: str) -> Path:
+        assert self.speaker_transform_dir is not None
+        speakers_dir = self.speaker_transform_dir / "speakers"
+        return (speakers_dir if speakers_dir.is_dir() else self.speaker_transform_dir) / f"{speaker_id}.npy"
+
+    def _load_speaker_transform(self, speaker_id: str) -> torch.Tensor:
+        transform = self._speaker_transform_cache.get(speaker_id)
+        if transform is not None:
+            self._speaker_transform_cache.move_to_end(speaker_id)
+            return transform
+
+        transform_path = self._speaker_transform_path(speaker_id)
+        if not transform_path.is_file():
+            raise FileNotFoundError(f"Speaker transform is missing for LibriSpeech speaker {speaker_id}: {transform_path}")
+        transform = torch.from_numpy(np.load(transform_path)).float().contiguous()
+        expected_shape = (self.feature_dim, self.speaker_transform_output_dim)
+        if tuple(transform.shape) != expected_shape:
+            raise ValueError(
+                f"Expected speaker {speaker_id} transform shape {expected_shape}, found {tuple(transform.shape)} "
+                f"in {transform_path}."
+            )
+        self._speaker_transform_cache[speaker_id] = transform
+        if len(self._speaker_transform_cache) > self.speaker_transform_cache_size:
+            self._speaker_transform_cache.popitem(last=False)
+        return transform
 
     def _load_features(self, audio_path: Path) -> torch.Tensor:
         feature_path = self._feature_path(audio_path)
@@ -88,7 +158,10 @@ class VocosDataset(Dataset):
             )
         if features.size(0) == 0:
             raise ValueError(f"Precomputed WavLM feature file has no frames: {feature_path}")
-        return features.float()
+        features = features.float()
+        if self.use_speaker_transform:
+            features = features @ self._load_speaker_transform(self._speaker_id(audio_path))
+        return features
 
     @staticmethod
     def _repeat_to_length(values: torch.Tensor, length: int, dim: int) -> torch.Tensor:

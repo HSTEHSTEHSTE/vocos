@@ -16,6 +16,11 @@ data:
       feature_source_root: ???
       feature_hop_length: 480
       feature_dim: 1024
+      # Toggle LinearVC 75-D content features with per-speaker 75->1024 lifts.
+      use_speaker_transform: false
+      speaker_transform_dir: null
+      speaker_transform_output_dim: 1024
+      speaker_transform_cache_size: 64
     val_params:
       filelist_path: ???
       sampling_rate: 24000
@@ -26,6 +31,10 @@ data:
       feature_source_root: ???
       feature_hop_length: 480
       feature_dim: 1024
+      use_speaker_transform: false
+      speaker_transform_dir: null
+      speaker_transform_output_dim: 1024
+      speaker_transform_cache_size: 64
 
 model:
   class_path: vocos.experiment.VocosExp
