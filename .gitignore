@@ -162,3 +162,9 @@ cython_debug/
 logs/
 *.pt
 *.ckpt
+
+# Cluster job artifacts and submission scripts
+slurm/
+*.sbatch
+*.slurm
+slurm-*.sh

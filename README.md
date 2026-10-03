@@ -189,6 +189,27 @@ The preflight verifies every selected 75-D tensor and that each LibriSpeech spea
 has a matrix in `speakers/<speaker-id>.npy`. It also rejects mismatched LinearVC
 projection provenance when both artifact manifests are present.
 
+#### Direct 75-D content features with ECAPA speaker conditioning
+
+`configs/wavlm-causal-content75-ecapa.yaml` trains a separate, from-scratch
+causal Vocos architecture. It accepts the 75-D content features directly and
+uses a frozen 192-D ECAPA-TDNN speaker enrollment vector to FiLM-condition each
+causal ConvNeXt block. It does not use the 75-to-1024 speaker transforms.
+
+Create the enrollment vectors from a filelist of speaker-reference utterances
+that is separate from the Vocos targets:
+
+```bash
+python extract_ecapa_speaker_embeddings.py \
+  --enrollment-filelist /path/to/enrollment.txt \
+  --output-dir /scratch/path/to/ecapa-enrollments
+```
+
+The output contains `speakers/<speaker-id>.npy` vectors and an enrollment
+manifest. Pass the same directory as `speaker_embedding_dir` for training and
+as `--speaker-embedding-dir` during inference. The external enrollment vector
+is constant for every generated chunk, preserving zero-look-ahead decoding.
+
 ## Contributing
 
 Bug reports, documentation improvements, and focused fixes are welcome. Please read

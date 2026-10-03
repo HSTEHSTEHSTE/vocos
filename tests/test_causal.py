@@ -5,12 +5,12 @@ from vocos.heads import CausalISTFTHead
 from vocos.models import CausalVocosBackbone
 
 
-def _stream_backbone(backbone, features, chunk_sizes):
+def _stream_backbone(backbone, features, chunk_sizes, **kwargs):
     state = None
     outputs = []
     offset = 0
     for size in chunk_sizes:
-        output, state = backbone.forward_stream(features[..., offset : offset + size], state)
+        output, state = backbone.forward_stream(features[..., offset : offset + size], state, **kwargs)
         outputs.append(output)
         offset += size
     return torch.cat(outputs, dim=1)
@@ -25,6 +25,26 @@ def test_causal_backbone_streaming_matches_full_forward():
     stream_output = _stream_backbone(backbone, features, [2, 5, 4])
 
     torch.testing.assert_close(stream_output, full_output, atol=1e-6, rtol=1e-6)
+
+
+def test_speaker_conditioned_causal_backbone_streaming_matches_full_forward():
+    torch.manual_seed(0)
+    backbone = CausalVocosBackbone(
+        input_channels=3, dim=8, intermediate_dim=16, num_layers=2, speaker_embedding_dim=5
+    ).eval()
+    with torch.no_grad():
+        for conditioner in backbone.speaker_conditioners:
+            conditioner[-1].weight.normal_(mean=0, std=0.02)
+    features = torch.randn(2, 3, 11)
+    speaker_embedding = torch.randn(2, 5)
+
+    full_output = backbone(features, speaker_embedding=speaker_embedding)
+    stream_output = _stream_backbone(
+        backbone, features, [2, 5, 4], speaker_embedding=speaker_embedding
+    )
+
+    torch.testing.assert_close(stream_output, full_output, atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(full_output, backbone(features, speaker_embedding=-speaker_embedding))
 
 
 def test_causal_backbone_prefix_does_not_depend_on_future_features():

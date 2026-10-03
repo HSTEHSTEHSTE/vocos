@@ -37,6 +37,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional LinearVC speaker-transform directory. Lifts 75-D content features to the model's 1024-D input.",
     )
+    parser.add_argument(
+        "--speaker-embedding-dir",
+        type=Path,
+        help=(
+            "Optional ECAPA root. Supports speakers/<speaker-id>.npy enrollment embeddings or "
+            "utterances/<LibriSpeech-relative-path>.npy vectors; utterance roots use a deterministic "
+            "non-target vector from the same speaker."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ARTIFACT_ROOT / "inference")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and checkpoint loading without synthesis.")
@@ -115,6 +124,40 @@ def lift_features_for_librispeech_speaker(features: torch.Tensor, audio_path: Pa
     return features @ transform
 
 
+def load_speaker_embedding_for_librispeech_speaker(
+    audio_path: Path, embedding_dir: Path, feature_source_root: Path
+) -> tuple[torch.Tensor, Path]:
+    speaker_id = audio_path.parent.parent.name
+    if not speaker_id.isdigit():
+        raise ValueError(f"Cannot infer a LibriSpeech speaker ID from {audio_path}")
+    speakers_dir = embedding_dir / "speakers"
+    if speakers_dir.is_dir():
+        embedding_path = speakers_dir / f"{speaker_id}.npy"
+    else:
+        utterances_dir = embedding_dir / "utterances"
+        utterances_dir = utterances_dir if utterances_dir.is_dir() else embedding_dir
+        try:
+            relative_audio_path = audio_path.relative_to(feature_source_root)
+        except ValueError as exc:
+            raise ValueError("Audio is outside --feature-source-root; cannot find its utterance ECAPA vector.") from exc
+        if len(relative_audio_path.parts) < 4:
+            raise ValueError(f"Expected a LibriSpeech-relative audio path, got {relative_audio_path}")
+        target_embedding_path = (utterances_dir / relative_audio_path).with_suffix(".npy")
+        speaker_dir = utterances_dir / relative_audio_path.parts[0] / speaker_id
+        candidates = sorted(path for path in speaker_dir.rglob("*.npy") if path != target_embedding_path)
+        if not candidates:
+            raise FileNotFoundError(
+                f"No non-target utterance ECAPA vector found for LibriSpeech speaker {speaker_id} in {speaker_dir}"
+            )
+        embedding_path = candidates[0]
+    if not embedding_path.is_file():
+        raise FileNotFoundError(f"Speaker embedding is missing: {embedding_path}")
+    embedding = torch.from_numpy(np.load(embedding_path)).float().contiguous().squeeze()
+    if embedding.ndim != 1:
+        raise ValueError(f"Expected a rank-1 speaker embedding in {embedding_path}, got {tuple(embedding.shape)}.")
+    return embedding, embedding_path
+
+
 def align_features(features: torch.Tensor, target_frames: int) -> torch.Tensor:
     if features.size(0) == 0:
         raise ValueError("Feature tensor has no frames.")
@@ -150,6 +193,12 @@ def main() -> None:
     features = load_feature_tensor(feature_path)
     if args.speaker_transform_dir is not None:
         features = lift_features_for_librispeech_speaker(features, audio_path, args.speaker_transform_dir)
+    speaker_embedding = None
+    speaker_embedding_path = None
+    if args.speaker_embedding_dir is not None:
+        speaker_embedding, speaker_embedding_path = load_speaker_embedding_for_librispeech_speaker(
+            audio_path, args.speaker_embedding_dir, args.feature_source_root
+        )
     target_frames = math.ceil(source_audio.size(-1) / feature_hop_length)
     features = align_features(features, target_frames)
     model = instantiate_model(config, checkpoint_path, device)
@@ -166,6 +215,7 @@ def main() -> None:
         prediction = model(
             source_audio.to(device),
             precomputed_features=features.transpose(0, 1).unsqueeze(0).to(device),
+            speaker_embedding=None if speaker_embedding is None else speaker_embedding.unsqueeze(0).to(device),
         )[0].float().cpu().clamp(-1, 1)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -178,6 +228,8 @@ def main() -> None:
                 "audio": str(audio_path),
                 "feature": str(feature_path),
                 "checkpoint": str(checkpoint_path),
+                "speaker_embedding_dir": None if args.speaker_embedding_dir is None else str(args.speaker_embedding_dir),
+                "speaker_embedding": None if speaker_embedding_path is None else str(speaker_embedding_path),
                 "prediction": str(output_audio),
                 "sample_rate": sample_rate,
                 "input_samples": source_audio.size(-1),

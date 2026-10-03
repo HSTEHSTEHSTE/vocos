@@ -1,6 +1,7 @@
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils import weight_norm
 
@@ -104,11 +105,14 @@ class CausalVocosBackbone(Backbone):
         num_layers: int,
         layer_scale_init_value: Optional[float] = None,
         adanorm_num_embeddings: Optional[int] = None,
+        speaker_embedding_dim: Optional[int] = None,
+        speaker_conditioner_hidden_dim: Optional[int] = None,
     ):
         super().__init__()
         self.input_channels = input_channels
         self.embed = CausalConv1d(input_channels, dim, kernel_size=7)
         self.adanorm = adanorm_num_embeddings is not None
+        self.speaker_embedding_dim = speaker_embedding_dim
         if adanorm_num_embeddings:
             self.norm = AdaLayerNorm(adanorm_num_embeddings, dim, eps=1e-6)
         else:
@@ -125,8 +129,29 @@ class CausalVocosBackbone(Backbone):
                 for _ in range(num_layers)
             ]
         )
+        if speaker_embedding_dim is None:
+            self.speaker_conditioners = None
+        else:
+            if speaker_embedding_dim <= 0:
+                raise ValueError("speaker_embedding_dim must be positive when provided.")
+            conditioner_hidden_dim = speaker_conditioner_hidden_dim or dim
+            self.speaker_conditioners = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.LayerNorm(speaker_embedding_dim),
+                        nn.Linear(speaker_embedding_dim, conditioner_hidden_dim),
+                        nn.SiLU(),
+                        nn.Linear(conditioner_hidden_dim, 2 * dim),
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
         self.final_layer_norm = nn.LayerNorm(dim, eps=1e-6)
         self.apply(self._init_weights)
+        if self.speaker_conditioners is not None:
+            for conditioner in self.speaker_conditioners:
+                nn.init.zeros_(conditioner[-1].weight)
+                nn.init.zeros_(conditioner[-1].bias)
 
     @staticmethod
     def _init_weights(m):
@@ -141,11 +166,31 @@ class CausalVocosBackbone(Backbone):
             return self.norm(x.transpose(1, 2), cond_embedding_id=bandwidth_id).transpose(1, 2)
         return self.norm(x.transpose(1, 2)).transpose(1, 2)
 
+    def _apply_speaker_condition(
+        self, x: torch.Tensor, conditioner: nn.Module, speaker_embedding: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if speaker_embedding is None:
+            raise ValueError("speaker_embedding is required by this CausalVocosBackbone.")
+        if speaker_embedding.ndim != 2 or speaker_embedding.size(0) != x.size(0):
+            raise ValueError(
+                "speaker_embedding must have shape (batch, embedding_dim); "
+                f"received {tuple(speaker_embedding.shape)} for batch size {x.size(0)}."
+            )
+        if speaker_embedding.size(1) != self.speaker_embedding_dim:
+            raise ValueError(
+                f"Expected {self.speaker_embedding_dim}-D speaker embeddings, got {speaker_embedding.size(1)}."
+            )
+        gamma, beta = conditioner(F.normalize(speaker_embedding, dim=-1, eps=1e-8)).chunk(2, dim=-1)
+        return x * (1 + gamma.unsqueeze(-1)) + beta.unsqueeze(-1)
+
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         bandwidth_id = kwargs.get("bandwidth_id")
+        speaker_embedding = kwargs.get("speaker_embedding")
         x = self._post_embed(self.embed(x), bandwidth_id)
-        for block in self.convnext:
+        for index, block in enumerate(self.convnext):
             x = block(x, cond_embedding_id=bandwidth_id)
+            if self.speaker_conditioners is not None:
+                x = self._apply_speaker_condition(x, self.speaker_conditioners[index], speaker_embedding)
         return self.final_layer_norm(x.transpose(1, 2))
 
     def forward_stream(
@@ -153,14 +198,17 @@ class CausalVocosBackbone(Backbone):
     ) -> Tuple[torch.Tensor, Dict[str, object]]:
         """Decode one feature chunk and return its output plus the next state."""
         bandwidth_id = kwargs.get("bandwidth_id")
+        speaker_embedding = kwargs.get("speaker_embedding")
         state = {} if state is None else state
         x, embed_state = self.embed.forward_stream(x, state.get("embed"))
         x = self._post_embed(x, bandwidth_id)
 
         block_states = state.get("blocks", [None] * len(self.convnext))
         next_block_states = []
-        for block, block_state in zip(self.convnext, block_states):
+        for index, (block, block_state) in enumerate(zip(self.convnext, block_states)):
             x, block_state = block.forward_stream(x, block_state, cond_embedding_id=bandwidth_id)
+            if self.speaker_conditioners is not None:
+                x = self._apply_speaker_condition(x, self.speaker_conditioners[index], speaker_embedding)
             next_block_states.append(block_state)
         return self.final_layer_norm(x.transpose(1, 2)), {"embed": embed_state, "blocks": next_block_states}
 

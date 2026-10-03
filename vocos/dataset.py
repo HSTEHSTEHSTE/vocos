@@ -1,5 +1,6 @@
 import math
 import json
+import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,12 @@ class DataConfig:
     speaker_transform_dir: Optional[str] = None
     speaker_transform_output_dim: int = 1024
     speaker_transform_cache_size: int = 64
+    use_speaker_embedding: bool = False
+    speaker_embedding_dir: Optional[str] = None
+    speaker_embedding_dim: Optional[int] = None
+    speaker_embedding_cache_size: int = 64
+    speaker_embedding_random_same_speaker: bool = False
+    speaker_embedding_exclude_target: bool = True
 
 
 class VocosDataModule(LightningDataModule):
@@ -71,6 +78,14 @@ class VocosDataset(Dataset):
         self.speaker_transform_cache_size = cfg.speaker_transform_cache_size
         self._speaker_transform_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self.speaker_transform_dir = Path(cfg.speaker_transform_dir) if cfg.speaker_transform_dir else None
+        self.use_speaker_embedding = cfg.use_speaker_embedding
+        self.speaker_embedding_dim = cfg.speaker_embedding_dim
+        self.speaker_embedding_cache_size = cfg.speaker_embedding_cache_size
+        self._speaker_embedding_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self.speaker_embedding_dir = Path(cfg.speaker_embedding_dir) if cfg.speaker_embedding_dir else None
+        self.speaker_embedding_random_same_speaker = cfg.speaker_embedding_random_same_speaker
+        self.speaker_embedding_exclude_target = cfg.speaker_embedding_exclude_target
+        self._speaker_embedding_candidates: dict[str, tuple[Path, ...]] = {}
         if self.use_speaker_transform:
             if self.feature_root is None or self.feature_source_root is None or self.feature_dim is None:
                 raise ValueError("Speaker transforms require precomputed features with a declared source feature_dim.")
@@ -81,6 +96,21 @@ class VocosDataset(Dataset):
             if self.speaker_transform_cache_size <= 0:
                 raise ValueError("speaker_transform_cache_size must be positive.")
             self._validate_speaker_transform_provenance()
+        if self.use_speaker_embedding:
+            if self.speaker_embedding_dir is None:
+                raise ValueError("speaker_embedding_dir is required when use_speaker_embedding is true.")
+            if not self.speaker_embedding_dir.is_dir():
+                raise FileNotFoundError(f"Speaker-embedding directory is missing: {self.speaker_embedding_dir}")
+            if self.speaker_embedding_dim is None or self.speaker_embedding_dim <= 0:
+                raise ValueError("speaker_embedding_dim must be a positive integer when use_speaker_embedding is true.")
+            if self.speaker_embedding_cache_size <= 0:
+                raise ValueError("speaker_embedding_cache_size must be positive.")
+            if self.speaker_embedding_random_same_speaker:
+                if self.feature_source_root is None:
+                    raise ValueError(
+                        "Random same-speaker embeddings require feature_source_root to map audio paths to embeddings."
+                    )
+                self._initialize_random_speaker_embedding_candidates()
 
     def __len__(self) -> int:
         return len(self.filelist)
@@ -141,6 +171,92 @@ class VocosDataset(Dataset):
         if len(self._speaker_transform_cache) > self.speaker_transform_cache_size:
             self._speaker_transform_cache.popitem(last=False)
         return transform
+
+    def _speaker_embedding_path(self, speaker_id: str) -> Path:
+        assert self.speaker_embedding_dir is not None
+        speakers_dir = self.speaker_embedding_dir / "speakers"
+        return (speakers_dir if speakers_dir.is_dir() else self.speaker_embedding_dir) / f"{speaker_id}.npy"
+
+    def _utterance_embedding_root(self) -> Path:
+        assert self.speaker_embedding_dir is not None
+        utterances_dir = self.speaker_embedding_dir / "utterances"
+        return utterances_dir if utterances_dir.is_dir() else self.speaker_embedding_dir
+
+    def _utterance_embedding_path(self, audio_path: Path) -> Path:
+        assert self.feature_source_root is not None
+        try:
+            relative_path = audio_path.relative_to(self.feature_source_root)
+        except ValueError as exc:
+            raise ValueError(f"Audio path is outside feature_source_root: {audio_path}") from exc
+        return (self._utterance_embedding_root() / relative_path).with_suffix(".npy")
+
+    def _initialize_random_speaker_embedding_candidates(self) -> None:
+        candidates: dict[str, list[Path]] = {}
+        for file_name in self.filelist:
+            audio_path = Path(file_name)
+            candidates.setdefault(self._speaker_id(audio_path), []).append(audio_path)
+        self._speaker_embedding_candidates = {
+            speaker_id: tuple(sorted(paths)) for speaker_id, paths in candidates.items()
+        }
+
+    def _select_same_speaker_embedding_path(self, audio_path: Path) -> Path:
+        speaker_id = self._speaker_id(audio_path)
+        candidates = self._speaker_embedding_candidates.get(speaker_id, ())
+        if self.speaker_embedding_exclude_target:
+            candidates = tuple(path for path in candidates if path != audio_path)
+        if not candidates:
+            exclusion = "excluding the target utterance " if self.speaker_embedding_exclude_target else ""
+            raise ValueError(
+                f"No same-speaker ECAPA candidates found for {audio_path} ({exclusion}for speaker {speaker_id})."
+            )
+        if self.train:
+            return candidates[np.random.randint(len(candidates))]
+        # Keep validation repeatable while still using a non-target utterance.
+        digest = hashlib.blake2b(str(audio_path).encode(), digest_size=8).digest()
+        return candidates[int.from_bytes(digest, "little") % len(candidates)]
+
+    def _load_speaker_embedding(self, speaker_id: str) -> torch.Tensor:
+        embedding = self._speaker_embedding_cache.get(speaker_id)
+        if embedding is not None:
+            self._speaker_embedding_cache.move_to_end(speaker_id)
+            return embedding
+
+        embedding_path = self._speaker_embedding_path(speaker_id)
+        if not embedding_path.is_file():
+            raise FileNotFoundError(f"Speaker embedding is missing for LibriSpeech speaker {speaker_id}: {embedding_path}")
+        embedding = torch.from_numpy(np.load(embedding_path)).float().contiguous().squeeze()
+        expected_shape = (self.speaker_embedding_dim,)
+        if tuple(embedding.shape) != expected_shape:
+            raise ValueError(
+                f"Expected speaker {speaker_id} embedding shape {expected_shape}, found {tuple(embedding.shape)} "
+                f"in {embedding_path}."
+            )
+        self._speaker_embedding_cache[speaker_id] = embedding
+        if len(self._speaker_embedding_cache) > self.speaker_embedding_cache_size:
+            self._speaker_embedding_cache.popitem(last=False)
+        return embedding
+
+    def _load_utterance_speaker_embedding(self, audio_path: Path) -> torch.Tensor:
+        embedding_path = self._utterance_embedding_path(self._select_same_speaker_embedding_path(audio_path))
+        cache_key = str(embedding_path)
+        embedding = self._speaker_embedding_cache.get(cache_key)
+        if embedding is not None:
+            self._speaker_embedding_cache.move_to_end(cache_key)
+            return embedding
+
+        if not embedding_path.is_file():
+            raise FileNotFoundError(f"ECAPA utterance embedding is missing: {embedding_path}")
+        embedding = torch.from_numpy(np.load(embedding_path)).float().contiguous().squeeze()
+        expected_shape = (self.speaker_embedding_dim,)
+        if tuple(embedding.shape) != expected_shape:
+            raise ValueError(
+                f"Expected utterance ECAPA embedding shape {expected_shape}, found {tuple(embedding.shape)} "
+                f"in {embedding_path}."
+            )
+        self._speaker_embedding_cache[cache_key] = embedding
+        if len(self._speaker_embedding_cache) > self.speaker_embedding_cache_size:
+            self._speaker_embedding_cache.popitem(last=False)
+        return embedding
 
     def _load_features(self, audio_path: Path) -> torch.Tensor:
         feature_path = self._feature_path(audio_path)
@@ -228,4 +344,10 @@ class VocosDataset(Dataset):
         start_frame = 0 if not self.train else start // self.feature_hop_length
         required_frames = math.ceil(self.num_samples / self.feature_hop_length)
         features = features[start_frame : start_frame + required_frames]
-        return {"audio": y[0], "features": features.transpose(0, 1)}
+        batch = {"audio": y[0], "features": features.transpose(0, 1)}
+        if self.use_speaker_embedding:
+            if self.speaker_embedding_random_same_speaker:
+                batch["speaker_embedding"] = self._load_utterance_speaker_embedding(audio_path)
+            else:
+                batch["speaker_embedding"] = self._load_speaker_embedding(self._speaker_id(audio_path))
+        return batch

@@ -30,7 +30,10 @@ def main() -> None:
     freeze_pretrained = _parse_bool(os.environ.get("VOCOS_WARMSTART_FREEZE_PRETRAINED", "0"))
     source_kind = os.environ.get("VOCOS_WARMSTART_SOURCE_KIND", "official_mel")
 
-    cli = LightningCLI(run=False)
+    cli_kwargs = {"run": False}
+    if os.environ.get("VOCOS_RESUME_CKPT"):
+        cli_kwargs["save_config_callback"] = None
+    cli = LightningCLI(**cli_kwargs)
     if source_kind == "official_mel":
         report = warmstart_wavlm_causal_generator(cli.model, source_checkpoint)
     elif source_kind == "causal_wavlm":

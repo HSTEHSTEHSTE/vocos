@@ -132,23 +132,25 @@ class VocosExp(pl.LightningModule):
     @staticmethod
     def _split_batch(batch):
         if isinstance(batch, dict):
-            return batch["audio"], batch.get("features")
-        return batch, None
+            return batch["audio"], batch.get("features"), batch.get("speaker_embedding")
+        return batch, None, None
 
-    def forward(self, audio_input, precomputed_features=None, **kwargs):
+    def forward(self, audio_input, precomputed_features=None, speaker_embedding=None, **kwargs):
         feature_input = audio_input if precomputed_features is None else precomputed_features
         features = self.feature_extractor(feature_input, sample_rate=self.hparams.sample_rate, **kwargs)
-        x = self.backbone(features, **kwargs)
+        x = self.backbone(features, speaker_embedding=speaker_embedding, **kwargs)
         audio_output = self.head(x)
         return audio_output
 
     def training_step(self, batch, batch_idx, optimizer_idx, **kwargs):
-        audio_input, precomputed_features = self._split_batch(batch)
+        audio_input, precomputed_features, speaker_embedding = self._split_batch(batch)
 
         # train discriminator
         if optimizer_idx == 0 and self.train_discriminator:
             with torch.no_grad():
-                audio_hat = self(audio_input, precomputed_features=precomputed_features, **kwargs)
+                audio_hat = self(
+                    audio_input, precomputed_features=precomputed_features, speaker_embedding=speaker_embedding, **kwargs
+                )
 
             real_score_mp, gen_score_mp, _, _ = self.multiperioddisc(y=audio_input, y_hat=audio_hat, **kwargs,)
             real_score_mrd, gen_score_mrd, _, _ = self.multiresddisc(y=audio_input, y_hat=audio_hat, **kwargs,)
@@ -169,7 +171,9 @@ class VocosExp(pl.LightningModule):
 
         # train generator
         if optimizer_idx == 1:
-            audio_hat = self(audio_input, precomputed_features=precomputed_features, **kwargs)
+            audio_hat = self(
+                audio_input, precomputed_features=precomputed_features, speaker_embedding=speaker_embedding, **kwargs
+            )
             if self.train_discriminator:
                 _, gen_score_mp, fmap_rs_mp, fmap_gs_mp = self.multiperioddisc(
                     y=audio_input, y_hat=audio_hat, **kwargs,
@@ -223,8 +227,10 @@ class VocosExp(pl.LightningModule):
                 self.utmos_model = UTMOSScore(device=self.device)
 
     def validation_step(self, batch, batch_idx, **kwargs):
-        audio_input, precomputed_features = self._split_batch(batch)
-        audio_hat = self(audio_input, precomputed_features=precomputed_features, **kwargs)
+        audio_input, precomputed_features, speaker_embedding = self._split_batch(batch)
+        audio_hat = self(
+            audio_input, precomputed_features=precomputed_features, speaker_embedding=speaker_embedding, **kwargs
+        )
 
         audio_16_khz = torchaudio.functional.resample(audio_input, orig_freq=self.hparams.sample_rate, new_freq=16000)
         audio_hat_16khz = torchaudio.functional.resample(audio_hat, orig_freq=self.hparams.sample_rate, new_freq=16000)
@@ -268,6 +274,11 @@ class VocosExp(pl.LightningModule):
         }
 
     def validation_epoch_end(self, outputs):
+        # A periodic checkpoint may be taken between the train and validation
+        # loops. Older Lightning releases then resume into an empty validation
+        # epoch; there are no metrics or media to aggregate in that case.
+        if not outputs:
+            return
         if self.global_rank == 0:
             *_, audio_in, audio_pred = outputs[0].values()
             self._log_audio("val_in", audio_in)
