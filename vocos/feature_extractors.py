@@ -1,4 +1,6 @@
 import math
+import sys
+from pathlib import Path
 from typing import List
 
 import torch
@@ -7,6 +9,13 @@ from encodec import EncodecModel
 from torch import nn
 
 from vocos.modules import safe_log
+
+
+_WAVLM_SOURCE_DIR = Path(__file__).resolve().parents[2] / "unilm" / "wavlm"
+if str(_WAVLM_SOURCE_DIR) not in sys.path:
+    sys.path.insert(0, str(_WAVLM_SOURCE_DIR))
+
+from official_wavlm import OFFICIAL_WAVLM_LARGE_CHECKPOINT, load_official_wavlm_large
 
 
 class FeatureExtractor(nn.Module):
@@ -117,33 +126,30 @@ class WavLMFeatures(FeatureExtractor):
 
     def __init__(
         self,
-        model_name: str = "microsoft/wavlm-base-plus",
+        checkpoint_path: str = str(OFFICIAL_WAVLM_LARGE_CHECKPOINT),
         input_sample_rate: int = 16000,
         source_sample_rate: int = 24000,
         output_hop_length: int = 480,
-        feature_layer: int = -1,
+        feature_layer: int = 6,
         train_wavlm: bool = False,
     ):
         super().__init__()
-        try:
-            from transformers import WavLMModel
-        except ImportError as exc:
-            raise ImportError("WavLMFeatures requires the training dependencies. Install with `pip install vocos[train]`.") from exc
         self.input_sample_rate = input_sample_rate
         self.source_sample_rate = source_sample_rate
         self.output_hop_length = output_hop_length
-        self.feature_layer = feature_layer
         self.train_wavlm = train_wavlm
-        self.wavlm = WavLMModel.from_pretrained(model_name)
+        self.wavlm, config = load_official_wavlm_large(checkpoint_path)
+        self.feature_layer = config.encoder_layers if feature_layer == -1 else feature_layer
+        if not 1 <= self.feature_layer <= config.encoder_layers:
+            raise ValueError(
+                "feature_layer must be in [1, {}] (or -1 for the final layer), got {}".format(
+                    config.encoder_layers, feature_layer
+                )
+            )
         if not train_wavlm:
             self.wavlm.requires_grad_(False)
             self.wavlm.eval()
-        self.feature_dim = self.wavlm.config.hidden_size
-
-    @staticmethod
-    def _normalize(audio: torch.Tensor) -> torch.Tensor:
-        variance = audio.var(dim=-1, keepdim=True, unbiased=False)
-        return (audio - audio.mean(dim=-1, keepdim=True)) / variance.add(1e-7).sqrt()
+        self.feature_dim = config.encoder_embed_dim
 
     def forward(self, audio: torch.Tensor, **kwargs) -> torch.Tensor:
         output_sample_rate = kwargs.get("sample_rate", self.source_sample_rate)
@@ -153,15 +159,7 @@ class WavLMFeatures(FeatureExtractor):
             audio_16khz = audio
         if not self.train_wavlm:
             self.wavlm.eval()
-        outputs = self.wavlm(
-            self._normalize(audio_16khz),
-            output_hidden_states=self.feature_layer != -1,
-            return_dict=True,
-        )
-        if self.feature_layer == -1:
-            features = outputs.last_hidden_state
-        else:
-            features = outputs.hidden_states[self.feature_layer]
+        features, _ = self.wavlm.extract_features(audio_16khz, output_layer=self.feature_layer)
 
         # The convolutional WavLM frontend has a 400-sample receptive field, so
         # it can be one frame shorter than waveform_duration / 20 ms. Repeat the
