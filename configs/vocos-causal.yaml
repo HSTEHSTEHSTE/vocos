@@ -64,8 +64,15 @@ trainer:
       init_args:
         monitor: val_loss
         filename: vocos_causal_{epoch}_{step}_{val_loss:.4f}
-        save_top_k: 3
+        save_top_k: 1
+        save_last: false
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        filename: vocos_causal_periodic_{step}
+        every_n_train_steps: 5000
+        save_top_k: 0
         save_last: true
+    - class_path: vocos.helpers.SlurmPreemptionCheckpointCallback
     - class_path: vocos.helpers.GradNormCallback
   max_steps: 2000000
   limit_val_batches: 100

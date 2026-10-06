@@ -38,6 +38,20 @@ def parse_args() -> argparse.Namespace:
         help="Optional LinearVC speaker-transform directory. Lifts 75-D content features to the model's 1024-D input.",
     )
     parser.add_argument(
+        "--uscf-content-projection",
+        type=Path,
+        help="LinearVC 1024->content projection (.npy) for a source-to-target USCF conversion.",
+    )
+    parser.add_argument(
+        "--uscf-transform-dir",
+        type=Path,
+        help="Directory containing in-domain LinearVC per-speaker 75->1024 transforms under speakers/.",
+    )
+    parser.add_argument(
+        "--uscf-target-speaker",
+        help="LibriSpeech target speaker ID for a USCF conversion; must differ from the source speaker.",
+    )
+    parser.add_argument(
         "--speaker-embedding-dir",
         type=Path,
         help=(
@@ -49,7 +63,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ARTIFACT_ROOT / "inference")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and checkpoint loading without synthesis.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    uscf_args = (args.uscf_content_projection, args.uscf_transform_dir, args.uscf_target_speaker)
+    if any(value is not None for value in uscf_args) and not all(value is not None for value in uscf_args):
+        parser.error(
+            "--uscf-content-projection, --uscf-transform-dir, and --uscf-target-speaker must be used together."
+        )
+    if args.speaker_transform_dir is not None and args.uscf_content_projection is not None:
+        parser.error("--speaker-transform-dir cannot be combined with a USCF conversion.")
+    return args
 
 
 def import_class(class_path: str):
@@ -108,10 +130,15 @@ def load_feature_tensor(feature_path: Path) -> torch.Tensor:
     return features.float()
 
 
-def lift_features_for_librispeech_speaker(features: torch.Tensor, audio_path: Path, transform_dir: Path) -> torch.Tensor:
+def librispeech_speaker_id(audio_path: Path) -> str:
     speaker_id = audio_path.parent.parent.name
     if not speaker_id.isdigit():
         raise ValueError(f"Cannot infer a LibriSpeech speaker ID from {audio_path}")
+    return speaker_id
+
+
+def lift_features_for_librispeech_speaker(features: torch.Tensor, audio_path: Path, transform_dir: Path) -> torch.Tensor:
+    speaker_id = librispeech_speaker_id(audio_path)
     speakers_dir = transform_dir / "speakers"
     transform_path = (speakers_dir if speakers_dir.is_dir() else transform_dir) / f"{speaker_id}.npy"
     if not transform_path.is_file():
@@ -124,12 +151,63 @@ def lift_features_for_librispeech_speaker(features: torch.Tensor, audio_path: Pa
     return features @ transform
 
 
+def convert_features_uscf(
+    features: torch.Tensor,
+    audio_path: Path,
+    content_projection_path: Path,
+    transform_dir: Path,
+    target_speaker: str,
+) -> tuple[torch.Tensor, dict[str, str]]:
+    """Apply the in-domain USCF composition ``X @ UTXSS @ S_target``.
+
+    ``UTXSS`` is the globally learned 1024->75 content projection.  The
+    target decoder ``S_target`` is an existing 75->1024 transform derived from
+    non-streaming WavLM features for that LibriSpeech speaker.  The source
+    transform is loaded only as a domain-membership guard: source and target
+    must both have the corresponding in-domain transform available.
+    """
+    source_speaker = librispeech_speaker_id(audio_path)
+    if not target_speaker.isdigit():
+        raise ValueError(f"USCF target speaker must be numeric, got {target_speaker!r}")
+    if source_speaker == target_speaker:
+        raise ValueError("USCF source and target speakers must differ.")
+    if not content_projection_path.is_file():
+        raise FileNotFoundError(f"USCF content projection is missing: {content_projection_path}")
+    speakers_dir = transform_dir / "speakers"
+    if not speakers_dir.is_dir():
+        raise FileNotFoundError(f"USCF speaker-transform directory is missing: {speakers_dir}")
+    source_transform_path = speakers_dir / f"{source_speaker}.npy"
+    target_transform_path = speakers_dir / f"{target_speaker}.npy"
+    for path in (source_transform_path, target_transform_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"USCF in-domain speaker transform is missing: {path}")
+
+    content_projection = torch.from_numpy(np.load(content_projection_path)).float().contiguous()
+    target_transform = torch.from_numpy(np.load(target_transform_path)).float().contiguous()
+    if content_projection.ndim != 2 or content_projection.shape[0] != features.shape[1]:
+        raise ValueError(
+            f"USCF content projection {content_projection_path} must have shape "
+            f"({features.shape[1]}, content_dim), got {tuple(content_projection.shape)}."
+        )
+    if target_transform.ndim != 2 or target_transform.shape[0] != content_projection.shape[1]:
+        raise ValueError(
+            f"USCF target transform {target_transform_path} must have shape "
+            f"({content_projection.shape[1]}, output_dim), got {tuple(target_transform.shape)}."
+        )
+    converted = features @ content_projection @ target_transform
+    return converted, {
+        "source_speaker": source_speaker,
+        "target_speaker": target_speaker,
+        "content_projection": str(content_projection_path),
+        "source_transform": str(source_transform_path),
+        "target_transform": str(target_transform_path),
+    }
+
+
 def load_speaker_embedding_for_librispeech_speaker(
     audio_path: Path, embedding_dir: Path, feature_source_root: Path
 ) -> tuple[torch.Tensor, Path]:
-    speaker_id = audio_path.parent.parent.name
-    if not speaker_id.isdigit():
-        raise ValueError(f"Cannot infer a LibriSpeech speaker ID from {audio_path}")
+    speaker_id = librispeech_speaker_id(audio_path)
     speakers_dir = embedding_dir / "speakers"
     if speakers_dir.is_dir():
         embedding_path = speakers_dir / f"{speaker_id}.npy"
@@ -191,8 +269,17 @@ def main() -> None:
         source_audio = torchaudio.functional.resample(source_audio, source_rate, sample_rate)
 
     features = load_feature_tensor(feature_path)
+    uscf_metadata = None
     if args.speaker_transform_dir is not None:
         features = lift_features_for_librispeech_speaker(features, audio_path, args.speaker_transform_dir)
+    if args.uscf_content_projection is not None:
+        features, uscf_metadata = convert_features_uscf(
+            features,
+            audio_path,
+            args.uscf_content_projection,
+            args.uscf_transform_dir,
+            args.uscf_target_speaker,
+        )
     speaker_embedding = None
     speaker_embedding_path = None
     if args.speaker_embedding_dir is not None:
@@ -207,6 +294,11 @@ def main() -> None:
     print(f"Audio: {audio_path}")
     print(f"Features: {feature_path}")
     print(f"Feature shape: {tuple(features.shape)}")
+    if uscf_metadata is not None:
+        print(
+            f"USCF conversion: {uscf_metadata['source_speaker']} -> "
+            f"{uscf_metadata['target_speaker']}",
+        )
     if args.dry_run:
         print("Dry run succeeded.")
         return
@@ -219,8 +311,11 @@ def main() -> None:
         )[0].float().cpu().clamp(-1, 1)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    output_audio = args.output_dir / f"{audio_path.stem}_pred.wav"
-    output_metadata = args.output_dir / f"{audio_path.stem}_pred.json"
+    output_stem = audio_path.stem
+    if uscf_metadata is not None:
+        output_stem += f"_uscf_{uscf_metadata['source_speaker']}_to_{uscf_metadata['target_speaker']}"
+    output_audio = args.output_dir / f"{output_stem}_pred.wav"
+    output_metadata = args.output_dir / f"{output_stem}_pred.json"
     torchaudio.save(output_audio, prediction.unsqueeze(0), sample_rate)
     output_metadata.write_text(
         json.dumps(
@@ -230,6 +325,7 @@ def main() -> None:
                 "checkpoint": str(checkpoint_path),
                 "speaker_embedding_dir": None if args.speaker_embedding_dir is None else str(args.speaker_embedding_dir),
                 "speaker_embedding": None if speaker_embedding_path is None else str(speaker_embedding_path),
+                "uscf": uscf_metadata,
                 "prediction": str(output_audio),
                 "sample_rate": sample_rate,
                 "input_samples": source_audio.size(-1),
