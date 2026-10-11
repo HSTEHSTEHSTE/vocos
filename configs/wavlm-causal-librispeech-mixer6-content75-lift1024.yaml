@@ -1,0 +1,116 @@
+# Causal Vocos on the exact LibriSpeech + Mixer6 data mix prepared for the
+# corresponding BigVGAN run.  Both corpora use causal teacher/student WavLM
+# layer-6 rank-75 content, lifted online by their own enrolled-speaker 75x1024
+# transforms.  The 16 kHz / 320-sample hop preserves the source 20 ms frame
+# geometry.
+seed_everything: 4444
+
+data:
+  class_path: vocos.dataset.VocosDataModule
+  init_args:
+    train_params:
+      filelist_path: ???
+      sampling_rate: 16000
+      num_samples: 40960
+      batch_size: 1
+      num_workers: 8
+      feature_root_mappings:
+        - audio_root: /weka/scratch/jhu/nandrew9/corpora/LibriSpeech
+          feature_root: /weka/scratch/jhu/nandrew9/xli257/linearvc/features/causal_wavlm_teacher_l6_student_l6_chunk20ms_kvhistory10s_triton_compiled_content_utxss_rank75/LibriSpeech
+        - audio_root: /weka/scratch/jhu/nandrew9/corpora/mixer6_ldc2013s03_pcm_flac_excluding_arts_evalset/data/pcm_flac
+          feature_root: /weka/scratch/jhu/nandrew9/xli257/linearvc/features/causal_wavlm_teacher_l6_student_l6_chunk20ms_kvhistory10s_triton_compiled_content_utxss_rank75/Mixer6
+      speaker_transform_mappings:
+        - audio_root: /weka/scratch/jhu/nandrew9/corpora/LibriSpeech
+          transform_dir: /weka/scratch/jhu/nandrew9/xli257/linearvc/assets/cf_tts/content_factorization/librispeech_wavlm_large_layer6_uscf_all_speakers
+        - audio_root: /weka/scratch/jhu/nandrew9/corpora/mixer6_ldc2013s03_pcm_flac_excluding_arts_evalset/data/pcm_flac
+          transform_dir: /weka/scratch/jhu/nandrew9/xli257/linearvc/assets/cf_tts/content_factorization/mixer6_nonstreaming_official_wavlm_l6_uscf
+          speaker_id_regex: '_(?:LDC|HRM)_(\d+)_CH\d+\.flac$'
+      feature_hop_length: 320
+      feature_dim: 75
+      use_speaker_transform: true
+      speaker_transform_output_dim: 1024
+      speaker_transform_cache_size: 64
+    val_params:
+      filelist_path: ???
+      sampling_rate: 16000
+      num_samples: 40960
+      batch_size: 1
+      num_workers: 8
+      feature_root_mappings:
+        - audio_root: /weka/scratch/jhu/nandrew9/corpora/LibriSpeech
+          feature_root: /weka/scratch/jhu/nandrew9/xli257/linearvc/features/causal_wavlm_teacher_l6_student_l6_chunk20ms_kvhistory10s_triton_compiled_content_utxss_rank75/LibriSpeech
+        - audio_root: /weka/scratch/jhu/nandrew9/corpora/mixer6_ldc2013s03_pcm_flac_excluding_arts_evalset/data/pcm_flac
+          feature_root: /weka/scratch/jhu/nandrew9/xli257/linearvc/features/causal_wavlm_teacher_l6_student_l6_chunk20ms_kvhistory10s_triton_compiled_content_utxss_rank75/Mixer6
+      speaker_transform_mappings:
+        - audio_root: /weka/scratch/jhu/nandrew9/corpora/LibriSpeech
+          transform_dir: /weka/scratch/jhu/nandrew9/xli257/linearvc/assets/cf_tts/content_factorization/librispeech_wavlm_large_layer6_uscf_all_speakers
+        - audio_root: /weka/scratch/jhu/nandrew9/corpora/mixer6_ldc2013s03_pcm_flac_excluding_arts_evalset/data/pcm_flac
+          transform_dir: /weka/scratch/jhu/nandrew9/xli257/linearvc/assets/cf_tts/content_factorization/mixer6_nonstreaming_official_wavlm_l6_uscf
+          speaker_id_regex: '_(?:LDC|HRM)_(\d+)_CH\d+\.flac$'
+      feature_hop_length: 320
+      feature_dim: 75
+      use_speaker_transform: true
+      speaker_transform_output_dim: 1024
+      speaker_transform_cache_size: 64
+
+model:
+  class_path: vocos.experiment.VocosExp
+  init_args:
+    sample_rate: 16000
+    initial_learning_rate: 5e-4
+    mel_loss_coeff: 45
+    mrd_loss_coeff: 0.1
+    num_warmup_steps: 0
+    pretrain_mel_steps: 0
+    evaluate_utmos: false
+    evaluate_pesq: true
+    evaluate_mrstft: true
+    evaluate_periodicty: false
+    validation_metric_batches: 4
+    validation_metrics_affect_val_loss: false
+    feature_extractor:
+      class_path: vocos.feature_extractors.PrecomputedWavLMFeatures
+      init_args:
+        feature_dim: 1024
+    backbone:
+      class_path: vocos.models.CausalVocosBackbone
+      init_args:
+        input_channels: 1024
+        dim: 512
+        intermediate_dim: 1536
+        num_layers: 8
+    head:
+      class_path: vocos.heads.CausalISTFTHead
+      init_args:
+        dim: 512
+        n_fft: 1280
+        hop_length: 320
+
+trainer:
+  logger:
+    class_path: pytorch_lightning.loggers.WandbLogger
+    init_args:
+      project: vocos-wavlm-causal
+      save_dir: logs/
+  callbacks:
+    - class_path: pytorch_lightning.callbacks.LearningRateMonitor
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_loss
+        filename: vocos_libri_mixer_lift_{epoch}_{step}_{val_loss:.4f}
+        save_top_k: 1
+        save_last: false
+    - class_path: pytorch_lightning.callbacks.ModelCheckpoint
+      init_args:
+        filename: vocos_libri_mixer_lift_periodic_{step}
+        every_n_train_steps: 5000
+        save_top_k: 0
+        save_last: true
+    - class_path: vocos.helpers.SlurmPreemptionCheckpointCallback
+    - class_path: vocos.helpers.GradNormCallback
+  max_steps: 2000000
+  limit_val_batches: 64
+  accelerator: gpu
+  strategy: ddp
+  devices: 1
+  log_every_n_steps: 100

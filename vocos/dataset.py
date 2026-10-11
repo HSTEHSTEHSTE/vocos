@@ -1,16 +1,18 @@
 import math
 import json
 import hashlib
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
 import torchaudio
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data._utils.collate import default_collate
 
 torch.set_num_threads(1)
 
@@ -24,6 +26,12 @@ class DataConfig:
     num_workers: int
     feature_root: Optional[str] = None
     feature_source_root: Optional[str] = None
+    # Optional corpus routing for one manifest that spans multiple audio roots.
+    # Each feature mapping has ``audio_root`` and ``feature_root``.  Each
+    # transform mapping has ``audio_root``, ``transform_dir``, and optionally
+    # ``speaker_id_regex``.  The most specific matching audio root wins.
+    feature_root_mappings: Optional[list[dict[str, str]]] = None
+    speaker_transform_mappings: Optional[list[dict[str, str]]] = None
     feature_hop_length: int = 480
     feature_dim: Optional[int] = None
     use_speaker_transform: bool = False
@@ -36,6 +44,25 @@ class DataConfig:
     speaker_embedding_cache_size: int = 64
     speaker_embedding_random_same_speaker: bool = False
     speaker_embedding_exclude_target: bool = True
+    use_speaker_matrix: bool = False
+    speaker_matrix_dir: Optional[str] = None
+    speaker_matrix_input_dim: int = 75
+    speaker_matrix_output_dim: int = 1024
+    speaker_matrix_cache_size: int = 64
+    # Choose one matrix uniformly per batch instead of deriving it from the
+    # source utterance's speaker ID. Useful for randomized USCF transforms.
+    speaker_matrix_random: bool = False
+    # Optional path-based speaker-ID extractor.  It must contain one capture
+    # group and permits non-LibriSpeech corpora such as Mixer6.
+    speaker_id_regex: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CorpusFeatureMapping:
+    audio_root: Path
+    feature_root: Path
+    speaker_transform_dir: Optional[Path]
+    speaker_id_pattern: Optional[re.Pattern[str]]
 
 
 class VocosDataModule(LightningDataModule):
@@ -47,7 +74,12 @@ class VocosDataModule(LightningDataModule):
     def _get_dataloder(self, cfg: DataConfig, train: bool):
         dataset = VocosDataset(cfg, train=train)
         dataloader = DataLoader(
-            dataset, batch_size=cfg.batch_size, num_workers=cfg.num_workers, shuffle=train, pin_memory=True,
+            dataset,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+            shuffle=train,
+            pin_memory=True,
+            collate_fn=dataset.collate_batch if dataset.speaker_matrix_random else None,
         )
         return dataloader
 
@@ -67,8 +99,15 @@ class VocosDataset(Dataset):
         self.train = train
         self.feature_root = Path(cfg.feature_root) if cfg.feature_root is not None else None
         self.feature_source_root = Path(cfg.feature_source_root) if cfg.feature_source_root is not None else None
-        if (self.feature_root is None) != (self.feature_source_root is None):
+        self.corpus_feature_mappings = self._parse_corpus_feature_mappings(cfg)
+        if self.corpus_feature_mappings and (self.feature_root is not None or self.feature_source_root is not None):
+            raise ValueError(
+                "feature_root_mappings cannot be combined with feature_root or feature_source_root; "
+                "use one routing mode."
+            )
+        if not self.corpus_feature_mappings and (self.feature_root is None) != (self.feature_source_root is None):
             raise ValueError("feature_root and feature_source_root must either both be set or both be omitted.")
+        self.has_precomputed_features = bool(self.corpus_feature_mappings) or self.feature_root is not None
         if cfg.feature_hop_length <= 0:
             raise ValueError("feature_hop_length must be positive.")
         self.feature_hop_length = cfg.feature_hop_length
@@ -86,13 +125,31 @@ class VocosDataset(Dataset):
         self.speaker_embedding_random_same_speaker = cfg.speaker_embedding_random_same_speaker
         self.speaker_embedding_exclude_target = cfg.speaker_embedding_exclude_target
         self._speaker_embedding_candidates: dict[str, tuple[Path, ...]] = {}
+        self.use_speaker_matrix = cfg.use_speaker_matrix
+        self.speaker_matrix_input_dim = cfg.speaker_matrix_input_dim
+        self.speaker_matrix_output_dim = cfg.speaker_matrix_output_dim
+        self.speaker_matrix_cache_size = cfg.speaker_matrix_cache_size
+        self._speaker_matrix_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self.speaker_matrix_dir = Path(cfg.speaker_matrix_dir) if cfg.speaker_matrix_dir else None
+        self.speaker_matrix_random = cfg.speaker_matrix_random
+        self._random_speaker_matrix_paths: tuple[Path, ...] = ()
+        self.speaker_id_pattern = None
+        if cfg.speaker_id_regex is not None:
+            try:
+                self.speaker_id_pattern = re.compile(cfg.speaker_id_regex)
+            except re.error as exc:
+                raise ValueError(f"Invalid speaker_id_regex {cfg.speaker_id_regex!r}: {exc}") from exc
+            if self.speaker_id_pattern.groups < 1:
+                raise ValueError("speaker_id_regex must contain a capture group for the speaker ID.")
         if self.use_speaker_transform:
-            if self.feature_root is None or self.feature_source_root is None or self.feature_dim is None:
+            if not self.has_precomputed_features or self.feature_dim is None:
                 raise ValueError("Speaker transforms require precomputed features with a declared source feature_dim.")
-            if self.speaker_transform_dir is None:
+            if not self.corpus_feature_mappings and self.speaker_transform_dir is None:
                 raise ValueError("speaker_transform_dir is required when use_speaker_transform is true.")
-            if not self.speaker_transform_dir.is_dir():
+            if self.speaker_transform_dir is not None and not self.speaker_transform_dir.is_dir():
                 raise FileNotFoundError(f"Speaker-transform directory is missing: {self.speaker_transform_dir}")
+            if any(mapping.speaker_transform_dir is None for mapping in self.corpus_feature_mappings):
+                raise ValueError("Every feature-root mapping needs a matching speaker-transform mapping.")
             if self.speaker_transform_cache_size <= 0:
                 raise ValueError("speaker_transform_cache_size must be positive.")
             self._validate_speaker_transform_provenance()
@@ -111,11 +168,110 @@ class VocosDataset(Dataset):
                         "Random same-speaker embeddings require feature_source_root to map audio paths to embeddings."
                     )
                 self._initialize_random_speaker_embedding_candidates()
+        if self.use_speaker_matrix:
+            if self.feature_dim is None:
+                raise ValueError("Speaker matrices require precomputed features with a declared feature_dim.")
+            if self.feature_dim != self.speaker_matrix_input_dim:
+                raise ValueError(
+                    "speaker_matrix_input_dim must equal feature_dim: "
+                    f"{self.speaker_matrix_input_dim} != {self.feature_dim}."
+                )
+            if self.speaker_matrix_dir is None:
+                raise ValueError("speaker_matrix_dir is required when use_speaker_matrix is true.")
+            if not self.speaker_matrix_dir.is_dir():
+                raise FileNotFoundError(f"Speaker-matrix directory is missing: {self.speaker_matrix_dir}")
+            if self.speaker_matrix_cache_size <= 0:
+                raise ValueError("speaker_matrix_cache_size must be positive.")
+            if self.speaker_matrix_random:
+                speakers_dir = self.speaker_matrix_dir / "speakers"
+                matrix_root = speakers_dir if speakers_dir.is_dir() else self.speaker_matrix_dir
+                paths = tuple(sorted(matrix_root.glob("*.npy")))
+                if not paths:
+                    raise FileNotFoundError(f"No random speaker matrices found under {matrix_root}")
+                self._random_speaker_matrix_paths = paths
+
+    @staticmethod
+    def _parse_speaker_pattern(value: Optional[str], context: str) -> Optional[re.Pattern[str]]:
+        if value is None:
+            return None
+        try:
+            pattern = re.compile(value)
+        except re.error as exc:
+            raise ValueError(f"Invalid speaker_id_regex for {context}: {value!r}: {exc}") from exc
+        if pattern.groups < 1:
+            raise ValueError(f"speaker_id_regex for {context} must contain a capture group for the speaker ID.")
+        return pattern
+
+    def _parse_corpus_feature_mappings(self, cfg: DataConfig) -> tuple[CorpusFeatureMapping, ...]:
+        feature_mappings = cfg.feature_root_mappings or []
+        transform_mappings = cfg.speaker_transform_mappings or []
+        if not feature_mappings and not transform_mappings:
+            return ()
+        if not feature_mappings:
+            raise ValueError("speaker_transform_mappings requires feature_root_mappings.")
+
+        transforms_by_root: dict[Path, dict[str, str]] = {}
+        for mapping in transform_mappings:
+            if not isinstance(mapping, dict):
+                raise ValueError("Each speaker_transform_mappings entry must be a mapping.")
+            try:
+                audio_root = Path(mapping["audio_root"]).resolve(strict=True)
+                transform_dir = Path(mapping["transform_dir"]).resolve(strict=True)
+            except KeyError as exc:
+                raise ValueError("speaker_transform_mappings entries require audio_root and transform_dir.") from exc
+            if not transform_dir.is_dir():
+                raise FileNotFoundError(f"Speaker-transform directory is missing: {transform_dir}")
+            if audio_root in transforms_by_root:
+                raise ValueError(f"Duplicate speaker-transform mapping for {audio_root}")
+            transforms_by_root[audio_root] = {
+                "transform_dir": str(transform_dir),
+                "speaker_id_regex": mapping.get("speaker_id_regex"),
+            }
+
+        parsed: list[CorpusFeatureMapping] = []
+        seen_roots: set[Path] = set()
+        for mapping in feature_mappings:
+            if not isinstance(mapping, dict):
+                raise ValueError("Each feature_root_mappings entry must be a mapping.")
+            try:
+                audio_root = Path(mapping["audio_root"]).resolve(strict=True)
+                feature_root = Path(mapping["feature_root"]).resolve(strict=True)
+            except KeyError as exc:
+                raise ValueError("feature_root_mappings entries require audio_root and feature_root.") from exc
+            if not feature_root.is_dir():
+                raise FileNotFoundError(f"Feature root is missing: {feature_root}")
+            if audio_root in seen_roots:
+                raise ValueError(f"Duplicate feature-root mapping for {audio_root}")
+            seen_roots.add(audio_root)
+            transform_mapping = transforms_by_root.pop(audio_root, None)
+            transform_dir = Path(transform_mapping["transform_dir"]) if transform_mapping is not None else None
+            speaker_pattern = self._parse_speaker_pattern(
+                transform_mapping.get("speaker_id_regex") if transform_mapping is not None else None,
+                str(audio_root),
+            )
+            parsed.append(CorpusFeatureMapping(audio_root, feature_root, transform_dir, speaker_pattern))
+        if transforms_by_root:
+            unknown_roots = ", ".join(str(path) for path in sorted(transforms_by_root))
+            raise ValueError(f"speaker_transform_mappings has roots absent from feature_root_mappings: {unknown_roots}")
+        return tuple(sorted(parsed, key=lambda item: len(str(item.audio_root)), reverse=True))
+
+    def _corpus_mapping_for(self, audio_path: Path) -> Optional[CorpusFeatureMapping]:
+        if not self.corpus_feature_mappings:
+            return None
+        resolved_audio = audio_path.resolve(strict=False)
+        for mapping in self.corpus_feature_mappings:
+            if resolved_audio.is_relative_to(mapping.audio_root):
+                return mapping
+        roots = ", ".join(str(mapping.audio_root) for mapping in self.corpus_feature_mappings)
+        raise ValueError(f"Audio path is outside all feature-root mappings: {audio_path}; roots={roots}")
 
     def __len__(self) -> int:
         return len(self.filelist)
 
     def _feature_path(self, audio_path: Path) -> Path:
+        mapping = self._corpus_mapping_for(audio_path)
+        if mapping is not None:
+            return (mapping.feature_root / audio_path.resolve(strict=False).relative_to(mapping.audio_root)).with_suffix(".pt")
         assert self.feature_root is not None and self.feature_source_root is not None
         try:
             relative_path = audio_path.relative_to(self.feature_source_root)
@@ -125,41 +281,93 @@ class VocosDataset(Dataset):
 
     def _validate_speaker_transform_provenance(self) -> None:
         """Reject known-incompatible LinearVC projection/decoder artifacts."""
-        assert self.feature_root is not None and self.speaker_transform_dir is not None
-        conversion_manifest = self.feature_root / "conversion-provenance.json"
-        transform_manifest = self.speaker_transform_dir / "speaker-transform-provenance.json"
-        if not conversion_manifest.is_file() or not transform_manifest.is_file():
-            return
-        conversion_projection = json.loads(conversion_manifest.read_text()).get("projection_sha256")
-        transform_projection = json.loads(transform_manifest.read_text()).get("projection_sha256")
-        if conversion_projection != transform_projection:
-            raise ValueError(
-                "The 75-D feature conversion and speaker transforms use different content projections: "
-                f"{conversion_projection!r} != {transform_projection!r}."
-            )
+        pairs: list[tuple[Path, Path]] = []
+        if self.corpus_feature_mappings:
+            pairs = [
+                (mapping.feature_root, mapping.speaker_transform_dir)
+                for mapping in self.corpus_feature_mappings
+                if mapping.speaker_transform_dir is not None
+            ]
+        elif self.feature_root is not None and self.speaker_transform_dir is not None:
+            pairs = [(self.feature_root, self.speaker_transform_dir)]
+        for feature_root, transform_dir in pairs:
+            conversion_manifest = feature_root / "conversion-provenance.json"
+            if not conversion_manifest.is_file():
+                conversion_manifest = feature_root / "extraction-metadata" / "extraction-provenance.json"
+            transform_manifest = transform_dir / "speaker-transform-provenance.json"
+            if not conversion_manifest.is_file() or not transform_manifest.is_file():
+                continue
+            conversion_projection = json.loads(conversion_manifest.read_text()).get("projection_sha256")
+            transform_data = json.loads(transform_manifest.read_text())
+            transform_projection = transform_data.get("projection_sha256")
+            if conversion_projection == transform_projection:
+                continue
+            conversion_data = json.loads(conversion_manifest.read_text())
+            conversion_path = conversion_data.get("projection_path")
+            transform_path = transform_data.get("projection_path")
+            projections_match = False
+            if conversion_path and transform_path:
+                conversion_array = np.load(conversion_path, mmap_mode="r")
+                transform_array = np.load(transform_path, mmap_mode="r")
+                projections_match = (
+                    conversion_array.shape == transform_array.shape == (1024, 75)
+                    and np.array_equal(conversion_array, transform_array)
+                )
+            elif conversion_path:
+                # Some older speaker-transform provenance stores the digest of
+                # the projection array rather than a path.  Compare the actual
+                # feature projection against that array digest, as the mixed
+                # BigVGAN manifest validator does.
+                conversion_array = np.load(conversion_path, mmap_mode="r")
+                conversion_array_digest = hashlib.sha256(
+                    np.ascontiguousarray(conversion_array).tobytes()
+                ).hexdigest()
+                projections_match = (
+                    conversion_array.shape == (1024, 75)
+                    and conversion_array_digest == transform_projection
+                )
+            if not projections_match:
+                raise ValueError(
+                    "The 75-D feature conversion and speaker transforms use different content projections: "
+                    f"{conversion_projection!r} != {transform_projection!r} for {feature_root}."
+                )
 
-    @staticmethod
-    def _speaker_id(audio_path: Path) -> str:
+    def _speaker_id(self, audio_path: Path) -> str:
+        mapping = self._corpus_mapping_for(audio_path)
+        pattern = mapping.speaker_id_pattern if mapping is not None else self.speaker_id_pattern
+        if pattern is not None:
+            match = pattern.search(str(audio_path))
+            if match is None or not match.group(1):
+                raise ValueError(
+                    f"Cannot infer a speaker ID from {audio_path} using {pattern.pattern!r}"
+                )
+            return match.group(1)
         # LibriSpeech paths are <split>/<speaker>/<chapter>/<utterance>.flac.
         speaker_id = audio_path.parent.parent.name
         if not speaker_id.isdigit():
-            raise ValueError(f"Cannot infer a LibriSpeech speaker ID from {audio_path}")
+            raise ValueError(
+                f"Cannot infer a LibriSpeech speaker ID from {audio_path}; set speaker_id_regex for this corpus."
+            )
         return speaker_id
 
-    def _speaker_transform_path(self, speaker_id: str) -> Path:
-        assert self.speaker_transform_dir is not None
-        speakers_dir = self.speaker_transform_dir / "speakers"
-        return (speakers_dir if speakers_dir.is_dir() else self.speaker_transform_dir) / f"{speaker_id}.npy"
+    def _speaker_transform_path(self, audio_path: Path, speaker_id: str) -> Path:
+        mapping = self._corpus_mapping_for(audio_path)
+        transform_dir = mapping.speaker_transform_dir if mapping is not None else self.speaker_transform_dir
+        assert transform_dir is not None
+        speakers_dir = transform_dir / "speakers"
+        return (speakers_dir if speakers_dir.is_dir() else transform_dir) / f"{speaker_id}.npy"
 
-    def _load_speaker_transform(self, speaker_id: str) -> torch.Tensor:
-        transform = self._speaker_transform_cache.get(speaker_id)
+    def _load_speaker_transform(self, audio_path: Path) -> torch.Tensor:
+        speaker_id = self._speaker_id(audio_path)
+        transform_path = self._speaker_transform_path(audio_path, speaker_id)
+        cache_key = str(transform_path)
+        transform = self._speaker_transform_cache.get(cache_key)
         if transform is not None:
-            self._speaker_transform_cache.move_to_end(speaker_id)
+            self._speaker_transform_cache.move_to_end(cache_key)
             return transform
 
-        transform_path = self._speaker_transform_path(speaker_id)
         if not transform_path.is_file():
-            raise FileNotFoundError(f"Speaker transform is missing for LibriSpeech speaker {speaker_id}: {transform_path}")
+            raise FileNotFoundError(f"Speaker transform is missing for speaker {speaker_id}: {transform_path}")
         transform = torch.from_numpy(np.load(transform_path)).float().contiguous()
         expected_shape = (self.feature_dim, self.speaker_transform_output_dim)
         if tuple(transform.shape) != expected_shape:
@@ -167,10 +375,70 @@ class VocosDataset(Dataset):
                 f"Expected speaker {speaker_id} transform shape {expected_shape}, found {tuple(transform.shape)} "
                 f"in {transform_path}."
             )
-        self._speaker_transform_cache[speaker_id] = transform
+        self._speaker_transform_cache[cache_key] = transform
         if len(self._speaker_transform_cache) > self.speaker_transform_cache_size:
             self._speaker_transform_cache.popitem(last=False)
         return transform
+
+    def _speaker_matrix_path(self, speaker_id: str) -> Path:
+        assert self.speaker_matrix_dir is not None
+        speakers_dir = self.speaker_matrix_dir / "speakers"
+        return (speakers_dir if speakers_dir.is_dir() else self.speaker_matrix_dir) / f"{speaker_id}.npy"
+
+    def _load_speaker_matrix(self, speaker_id: str) -> torch.Tensor:
+        matrix = self._speaker_matrix_cache.get(speaker_id)
+        if matrix is not None:
+            self._speaker_matrix_cache.move_to_end(speaker_id)
+            return matrix
+
+        matrix_path = self._speaker_matrix_path(speaker_id)
+        if not matrix_path.is_file():
+            raise FileNotFoundError(f"Speaker matrix is missing for LibriSpeech speaker {speaker_id}: {matrix_path}")
+        matrix = torch.from_numpy(np.load(matrix_path)).float().contiguous()
+        expected_shape = (self.speaker_matrix_input_dim, self.speaker_matrix_output_dim)
+        if tuple(matrix.shape) != expected_shape:
+            raise ValueError(
+                f"Expected speaker {speaker_id} matrix shape {expected_shape}, found {tuple(matrix.shape)} "
+                f"in {matrix_path}."
+            )
+        self._speaker_matrix_cache[speaker_id] = matrix
+        if len(self._speaker_matrix_cache) > self.speaker_matrix_cache_size:
+            self._speaker_matrix_cache.popitem(last=False)
+        return matrix
+
+    def _load_random_speaker_matrix(self) -> torch.Tensor:
+        if not self._random_speaker_matrix_paths:
+            raise RuntimeError("Random speaker-matrix sampling was not initialized.")
+        if self.train:
+            matrix_path = self._random_speaker_matrix_paths[np.random.randint(len(self._random_speaker_matrix_paths))]
+        else:
+            # Validation uses a fixed transform so its loss remains comparable
+            # across checkpoints.
+            matrix_path = self._random_speaker_matrix_paths[0]
+        cache_key = f"random:{matrix_path}"
+        matrix = self._speaker_matrix_cache.get(cache_key)
+        if matrix is not None:
+            self._speaker_matrix_cache.move_to_end(cache_key)
+            return matrix
+        matrix = torch.from_numpy(np.load(matrix_path)).float().contiguous()
+        expected_shape = (self.speaker_matrix_input_dim, self.speaker_matrix_output_dim)
+        if tuple(matrix.shape) != expected_shape:
+            raise ValueError(
+                f"Expected random speaker matrix shape {expected_shape}, found {tuple(matrix.shape)} in {matrix_path}."
+            )
+        self._speaker_matrix_cache[cache_key] = matrix
+        if len(self._speaker_matrix_cache) > self.speaker_matrix_cache_size:
+            self._speaker_matrix_cache.popitem(last=False)
+        return matrix
+
+    def collate_batch(self, items):
+        batch = default_collate(items)
+        if not isinstance(batch, dict):
+            raise TypeError("Random speaker-matrix batches must contain mapping samples.")
+        matrix = self._load_random_speaker_matrix()
+        batch_size = batch["audio"].size(0)
+        batch["speaker_matrix"] = matrix.unsqueeze(0).expand(batch_size, -1, -1).clone()
+        return batch
 
     def _speaker_embedding_path(self, speaker_id: str) -> Path:
         assert self.speaker_embedding_dir is not None
@@ -276,7 +544,7 @@ class VocosDataset(Dataset):
             raise ValueError(f"Precomputed WavLM feature file has no frames: {feature_path}")
         features = features.float()
         if self.use_speaker_transform:
-            features = features @ self._load_speaker_transform(self._speaker_id(audio_path))
+            features = features @ self._load_speaker_transform(audio_path)
         return features
 
     @staticmethod
@@ -309,7 +577,7 @@ class VocosDataset(Dataset):
         if sr != self.sampling_rate:
             y = torchaudio.functional.resample(y, orig_freq=sr, new_freq=self.sampling_rate)
 
-        features = self._load_features(audio_path) if self.feature_root is not None else None
+        features = self._load_features(audio_path) if self.has_precomputed_features else None
         if features is not None:
             features = self._align_features_to_audio(features, y.size(-1))
 
@@ -339,15 +607,24 @@ class VocosDataset(Dataset):
             y = y[:, : self.num_samples]
 
         if features is None:
-            return y[0]
-
-        start_frame = 0 if not self.train else start // self.feature_hop_length
-        required_frames = math.ceil(self.num_samples / self.feature_hop_length)
-        features = features[start_frame : start_frame + required_frames]
-        batch = {"audio": y[0], "features": features.transpose(0, 1)}
+            # On-the-fly feature extractors still need any static speaker
+            # conditioning. Preserve the compact tensor-only path only when
+            # there is no conditioning to carry alongside the audio crop.
+            if not self.use_speaker_embedding and not self.use_speaker_matrix:
+                return y[0]
+            batch = {"audio": y[0]}
+        else:
+            start_frame = 0 if not self.train else start // self.feature_hop_length
+            required_frames = math.ceil(self.num_samples / self.feature_hop_length)
+            features = features[start_frame : start_frame + required_frames]
+            batch = {"audio": y[0], "features": features.transpose(0, 1)}
         if self.use_speaker_embedding:
             if self.speaker_embedding_random_same_speaker:
                 batch["speaker_embedding"] = self._load_utterance_speaker_embedding(audio_path)
             else:
                 batch["speaker_embedding"] = self._load_speaker_embedding(self._speaker_id(audio_path))
+        if self.use_speaker_matrix and not self.speaker_matrix_random:
+            # The matrix is a static per-speaker conditioning signal. It is
+            # intentionally not applied to the 75-D features here.
+            batch["speaker_matrix"] = self._load_speaker_matrix(self._speaker_id(audio_path))
         return batch

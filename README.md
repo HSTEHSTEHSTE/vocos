@@ -169,6 +169,11 @@ Feature chunks must have shape `(batch, 1024, frames)`, and each frame produces 
 audio samples. The configured extractor uses a 100-frame left context and no future
 frames, so the conditioning and decoder are both zero-look-ahead.
 
+`infer_wavlm_causal.py` now uses this cached decoder path by default: it feeds
+10 chronological feature frames at a time and carries the returned state across
+the complete utterance. Use `--stream-chunk-frames N` to change the cadence and
+`--verify-streaming` to compare the result against one full-sequence decode.
+
 #### LinearVC 75-D content-feature toggle
 
 Set `VOCOS_FEATURE_MODE=linearvc_content75` when submitting the causal WavLM

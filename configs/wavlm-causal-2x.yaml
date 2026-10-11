@@ -44,8 +44,11 @@ model:
     num_warmup_steps: 0
     pretrain_mel_steps: 0
     evaluate_utmos: false
-    evaluate_pesq: false
+    evaluate_pesq: true
+    evaluate_mrstft: true
     evaluate_periodicty: false
+    validation_metric_batches: 4
+    validation_metrics_affect_val_loss: false
     feature_extractor:
       class_path: vocos.feature_extractors.PrecomputedWavLMFeatures
       init_args:

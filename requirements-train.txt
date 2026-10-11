@@ -6,4 +6,5 @@ transformers
 matplotlib
 torchcrepe
 pesq
+auraloss==0.4.0
 fairseq

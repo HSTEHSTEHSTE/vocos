@@ -1,5 +1,7 @@
 import torch
 
+from vocos.experiment import VocosExp
+from vocos.feature_extractors import PrecomputedWavLMFeatures
 from vocos.feature_extractors import MelSpectrogramFeatures
 from vocos.heads import CausalISTFTHead
 from vocos.models import CausalVocosBackbone
@@ -102,6 +104,28 @@ def test_causal_istft_head_streaming_matches_full_forward():
     stream_audio = torch.cat(chunks, dim=-1)
 
     assert full_audio.shape == (2, 36)
+    torch.testing.assert_close(stream_audio, full_audio, atol=1e-6, rtol=1e-6)
+
+
+def test_causal_experiment_streaming_matches_full_forward():
+    torch.manual_seed(0)
+    model = VocosExp(
+        feature_extractor=PrecomputedWavLMFeatures(feature_dim=3),
+        backbone=CausalVocosBackbone(input_channels=3, dim=8, intermediate_dim=16, num_layers=2),
+        head=CausalISTFTHead(dim=8, n_fft=16, hop_length=4),
+        sample_rate=16_000,
+        initial_learning_rate=1e-4,
+    ).eval()
+    features = torch.randn(2, 3, 11)
+    full_audio = model(torch.empty(2, 44), precomputed_features=features)
+
+    state = None
+    chunks = []
+    for feature_chunk in (features[..., :2], features[..., 2:7], features[..., 7:]):
+        audio, state = model.decode_stream(feature_chunk, state)
+        chunks.append(audio)
+    stream_audio = torch.cat(chunks, dim=-1)
+
     torch.testing.assert_close(stream_audio, full_audio, atol=1e-6, rtol=1e-6)
 
 

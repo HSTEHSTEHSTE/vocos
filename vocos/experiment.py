@@ -31,7 +31,10 @@ class VocosExp(pl.LightningModule):
         decay_mel_coeff: bool = False,
         evaluate_utmos: bool = False,
         evaluate_pesq: bool = False,
+        evaluate_mrstft: bool = False,
         evaluate_periodicty: bool = False,
+        validation_metric_batches: int = 0,
+        validation_metrics_affect_val_loss: bool = True,
         generator_learning_rate: float | None = None,
         discriminator_learning_rate: float | None = None,
     ):
@@ -49,7 +52,12 @@ class VocosExp(pl.LightningModule):
             decay_mel_coeff (bool, optional): If True, the Mel-spectrogram loss coefficient is decayed during training. Default is False.
             evaluate_utmos (bool, optional): If True, UTMOS scores are computed for each validation run.
             evaluate_pesq (bool, optional): If True, PESQ scores are computed for each validation run.
+            evaluate_mrstft (bool, optional): If True, multi-resolution STFT loss is computed for validation.
             evaluate_periodicty (bool, optional): If True, periodicity scores are computed for each validation run.
+            validation_metric_batches (int, optional): Number of deterministic validation batches used for
+                expensive metrics. Zero evaluates all validation batches.
+            validation_metrics_affect_val_loss (bool, optional): Retain the legacy composite validation
+                objective when true. Set false for new runs so model selection remains based on mel error.
         """
         super().__init__()
         self.save_hyperparameters(ignore=["feature_extractor", "backbone", "head"])
@@ -65,6 +73,10 @@ class VocosExp(pl.LightningModule):
         self.gen_loss = GeneratorLoss()
         self.feat_matching_loss = FeatureMatchingLoss()
         self.melspec_loss = MelSpecReconstructionLoss(sample_rate=sample_rate)
+        self.mrstft_loss = None
+
+        if validation_metric_batches < 0:
+            raise ValueError("validation_metric_batches must be non-negative")
 
         self.train_discriminator = False
         self.base_mel_coeff = self.mel_loss_coeff = mel_loss_coeff
@@ -132,24 +144,68 @@ class VocosExp(pl.LightningModule):
     @staticmethod
     def _split_batch(batch):
         if isinstance(batch, dict):
-            return batch["audio"], batch.get("features"), batch.get("speaker_embedding")
-        return batch, None, None
+            return batch["audio"], batch.get("features"), batch.get("speaker_embedding"), batch.get("speaker_matrix")
+        return batch, None, None, None
 
-    def forward(self, audio_input, precomputed_features=None, speaker_embedding=None, **kwargs):
+    def forward(self, audio_input, precomputed_features=None, speaker_embedding=None, speaker_matrix=None, **kwargs):
         feature_input = audio_input if precomputed_features is None else precomputed_features
-        features = self.feature_extractor(feature_input, sample_rate=self.hparams.sample_rate, **kwargs)
-        x = self.backbone(features, speaker_embedding=speaker_embedding, **kwargs)
+        features = self.feature_extractor(
+            feature_input,
+            sample_rate=self.hparams.sample_rate,
+            speaker_matrix=speaker_matrix,
+            **kwargs,
+        )
+        x = self.backbone(
+            features, speaker_embedding=speaker_embedding, speaker_matrix=speaker_matrix, **kwargs
+        )
         audio_output = self.head(x)
         return audio_output
 
+    @torch.inference_mode()
+    def decode_stream(
+        self,
+        features_input: torch.Tensor,
+        state: dict | None = None,
+        speaker_embedding: torch.Tensor | None = None,
+        speaker_matrix: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, dict]:
+        """Decode one chronological feature chunk while retaining causal state.
+
+        ``features_input`` has the same shape and meaning as
+        ``precomputed_features`` passed to :meth:`forward`.  Reuse the returned
+        state for the next chunk of the *same* utterance/stream.  Concatenating
+        all returned audio chunks is equivalent to decoding the complete
+        feature sequence at once, subject only to floating-point tolerance.
+        """
+        if not hasattr(self.backbone, "forward_stream") or not hasattr(self.head, "forward_stream"):
+            raise TypeError("decode_stream requires CausalVocosBackbone and CausalISTFTHead.")
+        state = {} if state is None else state
+        features = self.feature_extractor(
+            features_input,
+            sample_rate=self.hparams.sample_rate,
+            speaker_matrix=speaker_matrix,
+            **kwargs,
+        )
+        x, backbone_state = self.backbone.forward_stream(
+            features,
+            state.get("backbone"),
+            speaker_embedding=speaker_embedding,
+            speaker_matrix=speaker_matrix,
+            **kwargs,
+        )
+        audio_output, head_state = self.head.forward_stream(x, state.get("head"))
+        return audio_output, {"backbone": backbone_state, "head": head_state}
+
     def training_step(self, batch, batch_idx, optimizer_idx, **kwargs):
-        audio_input, precomputed_features, speaker_embedding = self._split_batch(batch)
+        audio_input, precomputed_features, speaker_embedding, speaker_matrix = self._split_batch(batch)
 
         # train discriminator
         if optimizer_idx == 0 and self.train_discriminator:
             with torch.no_grad():
                 audio_hat = self(
-                    audio_input, precomputed_features=precomputed_features, speaker_embedding=speaker_embedding, **kwargs
+                    audio_input, precomputed_features=precomputed_features, speaker_embedding=speaker_embedding,
+                    speaker_matrix=speaker_matrix, **kwargs
                 )
 
             real_score_mp, gen_score_mp, _, _ = self.multiperioddisc(y=audio_input, y_hat=audio_hat, **kwargs,)
@@ -172,7 +228,8 @@ class VocosExp(pl.LightningModule):
         # train generator
         if optimizer_idx == 1:
             audio_hat = self(
-                audio_input, precomputed_features=precomputed_features, speaker_embedding=speaker_embedding, **kwargs
+                audio_input, precomputed_features=precomputed_features, speaker_embedding=speaker_embedding,
+                speaker_matrix=speaker_matrix, **kwargs
             )
             if self.train_discriminator:
                 _, gen_score_mp, fmap_rs_mp, fmap_gs_mp = self.multiperioddisc(
@@ -225,47 +282,75 @@ class VocosExp(pl.LightningModule):
 
             if not hasattr(self, "utmos_model"):
                 self.utmos_model = UTMOSScore(device=self.device)
+        if self.hparams.evaluate_mrstft and self.mrstft_loss is None:
+            import auraloss
+
+            self.mrstft_loss = auraloss.freq.MultiResolutionSTFTLoss().to(self.device)
+
+    def _evaluate_expensive_validation_metrics(self, batch_idx: int) -> bool:
+        limit = self.hparams.validation_metric_batches
+        return limit == 0 or batch_idx < limit
+
+    @staticmethod
+    def _average_available(outputs, key: str):
+        values = [output[key] for output in outputs if output[key] is not None]
+        return None if not values else torch.stack(values).mean()
 
     def validation_step(self, batch, batch_idx, **kwargs):
-        audio_input, precomputed_features, speaker_embedding = self._split_batch(batch)
+        audio_input, precomputed_features, speaker_embedding, speaker_matrix = self._split_batch(batch)
         audio_hat = self(
-            audio_input, precomputed_features=precomputed_features, speaker_embedding=speaker_embedding, **kwargs
+            audio_input, precomputed_features=precomputed_features, speaker_embedding=speaker_embedding,
+            speaker_matrix=speaker_matrix, **kwargs
         )
 
         audio_16_khz = torchaudio.functional.resample(audio_input, orig_freq=self.hparams.sample_rate, new_freq=16000)
         audio_hat_16khz = torchaudio.functional.resample(audio_hat, orig_freq=self.hparams.sample_rate, new_freq=16000)
 
-        if self.hparams.evaluate_periodicty:
+        evaluate_metrics = self._evaluate_expensive_validation_metrics(batch_idx)
+
+        if evaluate_metrics and self.hparams.evaluate_periodicty:
             from metrics.periodicity import calculate_periodicity_metrics
 
             periodicity_loss, pitch_loss, f1_score = calculate_periodicity_metrics(audio_16_khz, audio_hat_16khz)
         else:
             periodicity_loss = pitch_loss = f1_score = 0
 
-        if self.hparams.evaluate_utmos:
+        if evaluate_metrics and self.hparams.evaluate_utmos:
             utmos_score = self.utmos_model.score(audio_hat_16khz.unsqueeze(1)).mean()
         else:
-            utmos_score = torch.zeros(1, device=self.device)
+            utmos_score = None
 
-        if self.hparams.evaluate_pesq:
+        if evaluate_metrics and self.hparams.evaluate_pesq:
             from pesq import pesq
 
             pesq_score = 0
             for ref, deg in zip(audio_16_khz.cpu().numpy(), audio_hat_16khz.cpu().numpy()):
                 pesq_score += pesq(16000, ref, deg, "wb", on_error=1)
             pesq_score /= len(audio_16_khz)
-            pesq_score = torch.tensor(pesq_score)
+            pesq_score = torch.tensor(pesq_score, device=self.device)
         else:
-            pesq_score = torch.zeros(1, device=self.device)
+            pesq_score = None
+
+        if evaluate_metrics and self.hparams.evaluate_mrstft:
+            assert self.mrstft_loss is not None
+            mrstft_loss = self.mrstft_loss(audio_hat.unsqueeze(1), audio_input.unsqueeze(1))
+        else:
+            mrstft_loss = None
 
         mel_loss = self.melspec_loss(audio_hat.unsqueeze(1), audio_input.unsqueeze(1))
-        total_loss = mel_loss + (5 - utmos_score) + (5 - pesq_score)
+        if self.hparams.validation_metrics_affect_val_loss:
+            utmos_for_loss = utmos_score if evaluate_metrics and self.hparams.evaluate_utmos else 0
+            pesq_for_loss = pesq_score if pesq_score is not None else 0
+            total_loss = mel_loss + (5 - utmos_for_loss) + (5 - pesq_for_loss)
+        else:
+            total_loss = mel_loss
 
         return {
             "val_loss": total_loss,
             "mel_loss": mel_loss,
             "utmos_score": utmos_score,
             "pesq_score": pesq_score,
+            "mrstft_loss": mrstft_loss,
             "periodicity_loss": periodicity_loss,
             "pitch_loss": pitch_loss,
             "f1_score": f1_score,
@@ -289,16 +374,23 @@ class VocosExp(pl.LightningModule):
             self._log_image("val_mel_hat", plot_spectrogram_to_numpy(mel_hat.data.cpu().numpy()))
         avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
         mel_loss = torch.stack([x["mel_loss"] for x in outputs]).mean()
-        utmos_score = torch.stack([x["utmos_score"] for x in outputs]).mean()
-        pesq_score = torch.stack([x["pesq_score"] for x in outputs]).mean()
+        utmos_score = self._average_available(outputs, "utmos_score")
+        pesq_score = self._average_available(outputs, "pesq_score")
+        mrstft_loss = self._average_available(outputs, "mrstft_loss")
         periodicity_loss = np.array([x["periodicity_loss"] for x in outputs]).mean()
         pitch_loss = np.array([x["pitch_loss"] for x in outputs]).mean()
         f1_score = np.array([x["f1_score"] for x in outputs]).mean()
 
         self.log("val_loss", avg_loss, sync_dist=True)
         self.log("val/mel_loss", mel_loss, sync_dist=True)
-        self.log("val/utmos_score", utmos_score, sync_dist=True)
-        self.log("val/pesq_score", pesq_score, sync_dist=True)
+        self.log("val/mel_spec_error", mel_loss, sync_dist=True)
+        if utmos_score is not None:
+            self.log("val/utmos_score", utmos_score, sync_dist=True)
+        if pesq_score is not None:
+            self.log("val/pesq_score", pesq_score, sync_dist=True)
+            self.log("val/pesq", pesq_score, sync_dist=True)
+        if mrstft_loss is not None:
+            self.log("val/mrstft", mrstft_loss, sync_dist=True)
         self.log("val/periodicity_loss", periodicity_loss, sync_dist=True)
         self.log("val/pitch_loss", pitch_loss, sync_dist=True)
         self.log("val/f1_score", f1_score, sync_dist=True)

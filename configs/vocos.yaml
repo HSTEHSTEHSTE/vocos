@@ -32,7 +32,10 @@ model:
     # Optional automatic evaluation metrics run during validation.
     evaluate_utmos: true
     evaluate_pesq: true
+    evaluate_mrstft: true
     evaluate_periodicty: true
+    validation_metric_batches: 4
+    validation_metrics_affect_val_loss: false
 
     feature_extractor:
       class_path: vocos.feature_extractors.MelSpectrogramFeatures

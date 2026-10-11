@@ -29,6 +29,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--filelist", type=Path, default=DEFAULT_ARTIFACT_ROOT / "filelists" / "librispeech_dev-clean.txt")
     parser.add_argument("--sample-index", type=int, default=0, help="Zero-based filelist index; exactly one entry is used.")
     parser.add_argument("--audio", type=Path, help="Override the one source audio path selected from --filelist.")
+    parser.add_argument(
+        "--speaker-id",
+        help="Explicit speaker ID for non-LibriSpeech inputs; required when using speaker transforms or matrices outside LibriSpeech.",
+    )
     parser.add_argument("--feature", type=Path, help="Override the feature tensor paired with --audio.")
     parser.add_argument("--feature-root", type=Path, default=DEFAULT_FEATURE_ROOT)
     parser.add_argument("--feature-source-root", type=Path, default=DEFAULT_SOURCE_ROOT)
@@ -48,6 +52,14 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing in-domain LinearVC per-speaker 75->1024 transforms under speakers/.",
     )
     parser.add_argument(
+        "--uscf-transforms-file",
+        type=Path,
+        help=(
+            "Packed LinearVC transforms.npy dictionary mapping LibriSpeech speaker IDs to "
+            "in-domain 75->1024 transforms."
+        ),
+    )
+    parser.add_argument(
         "--uscf-target-speaker",
         help="LibriSpeech target speaker ID for a USCF conversion; must differ from the source speaker.",
     )
@@ -60,17 +72,54 @@ def parse_args() -> argparse.Namespace:
             "non-target vector from the same speaker."
         ),
     )
+    parser.add_argument(
+        "--speaker-matrix-dir",
+        type=Path,
+        help=(
+            "Directory containing per-LibriSpeech-speaker 75x1024 matrices under speakers/. "
+            "The matrix is supplied as conditioning and is never multiplied with the input features."
+        ),
+    )
+    parser.add_argument(
+        "--stream-chunk-frames",
+        type=int,
+        default=10,
+        help=(
+            "Number of chronological feature frames per cached Vocos call. "
+            "The default is 10 frames (200 ms at the usual 20 ms feature rate)."
+        ),
+    )
+    parser.add_argument(
+        "--verify-streaming",
+        action="store_true",
+        help="Also decode the full feature sequence once and fail if it disagrees with cached streaming inference.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_ARTIFACT_ROOT / "inference")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and checkpoint loading without synthesis.")
     args = parser.parse_args()
-    uscf_args = (args.uscf_content_projection, args.uscf_transform_dir, args.uscf_target_speaker)
-    if any(value is not None for value in uscf_args) and not all(value is not None for value in uscf_args):
+    uscf_requested = any(
+        value is not None
+        for value in (
+            args.uscf_content_projection,
+            args.uscf_transform_dir,
+            args.uscf_transforms_file,
+            args.uscf_target_speaker,
+        )
+    )
+    if uscf_requested and (
+        args.uscf_content_projection is None
+        or args.uscf_target_speaker is None
+        or (args.uscf_transform_dir is None) == (args.uscf_transforms_file is None)
+    ):
         parser.error(
-            "--uscf-content-projection, --uscf-transform-dir, and --uscf-target-speaker must be used together."
+            "USCF requires --uscf-content-projection, --uscf-target-speaker, and exactly one of "
+            "--uscf-transform-dir or --uscf-transforms-file."
         )
     if args.speaker_transform_dir is not None and args.uscf_content_projection is not None:
         parser.error("--speaker-transform-dir cannot be combined with a USCF conversion.")
+    if args.stream_chunk_frames <= 0:
+        parser.error("--stream-chunk-frames must be positive.")
     return args
 
 
@@ -130,15 +179,21 @@ def load_feature_tensor(feature_path: Path) -> torch.Tensor:
     return features.float()
 
 
-def librispeech_speaker_id(audio_path: Path) -> str:
+def speaker_id_for_audio(audio_path: Path, explicit_speaker_id: str | None = None) -> str:
+    if explicit_speaker_id is not None:
+        if not explicit_speaker_id.strip():
+            raise ValueError("--speaker-id cannot be empty")
+        return explicit_speaker_id
     speaker_id = audio_path.parent.parent.name
     if not speaker_id.isdigit():
-        raise ValueError(f"Cannot infer a LibriSpeech speaker ID from {audio_path}")
+        raise ValueError(f"Cannot infer a LibriSpeech speaker ID from {audio_path}; pass --speaker-id.")
     return speaker_id
 
 
-def lift_features_for_librispeech_speaker(features: torch.Tensor, audio_path: Path, transform_dir: Path) -> torch.Tensor:
-    speaker_id = librispeech_speaker_id(audio_path)
+def lift_features_for_speaker(
+    features: torch.Tensor, audio_path: Path, transform_dir: Path, explicit_speaker_id: str | None = None
+) -> torch.Tensor:
+    speaker_id = speaker_id_for_audio(audio_path, explicit_speaker_id)
     speakers_dir = transform_dir / "speakers"
     transform_path = (speakers_dir if speakers_dir.is_dir() else transform_dir) / f"{speaker_id}.npy"
     if not transform_path.is_file():
@@ -155,35 +210,58 @@ def convert_features_uscf(
     features: torch.Tensor,
     audio_path: Path,
     content_projection_path: Path,
-    transform_dir: Path,
+    transform_dir: Path | None,
+    transforms_file: Path | None,
     target_speaker: str,
+    explicit_speaker_id: str | None = None,
 ) -> tuple[torch.Tensor, dict[str, str]]:
     """Apply the in-domain USCF composition ``X @ UTXSS @ S_target``.
 
     ``UTXSS`` is the globally learned 1024->75 content projection.  The
-    target decoder ``S_target`` is an existing 75->1024 transform derived from
-    non-streaming WavLM features for that LibriSpeech speaker.  The source
-    transform is loaded only as a domain-membership guard: source and target
-    must both have the corresponding in-domain transform available.
+    target decoder ``S_target`` is an existing 75->1024 transform derived for
+    that LibriSpeech speaker.  Transforms can be supplied as individual files
+    under ``speakers/`` or as the packed trusted ``transforms.npy`` artifact.
+    The source transform is used only as a domain-membership guard.
     """
-    source_speaker = librispeech_speaker_id(audio_path)
+    source_speaker = speaker_id_for_audio(audio_path, explicit_speaker_id)
     if not target_speaker.isdigit():
         raise ValueError(f"USCF target speaker must be numeric, got {target_speaker!r}")
     if source_speaker == target_speaker:
         raise ValueError("USCF source and target speakers must differ.")
     if not content_projection_path.is_file():
         raise FileNotFoundError(f"USCF content projection is missing: {content_projection_path}")
-    speakers_dir = transform_dir / "speakers"
-    if not speakers_dir.is_dir():
-        raise FileNotFoundError(f"USCF speaker-transform directory is missing: {speakers_dir}")
-    source_transform_path = speakers_dir / f"{source_speaker}.npy"
-    target_transform_path = speakers_dir / f"{target_speaker}.npy"
-    for path in (source_transform_path, target_transform_path):
-        if not path.is_file():
-            raise FileNotFoundError(f"USCF in-domain speaker transform is missing: {path}")
+    if transform_dir is not None:
+        speakers_dir = transform_dir / "speakers"
+        if not speakers_dir.is_dir():
+            raise FileNotFoundError(f"USCF speaker-transform directory is missing: {speakers_dir}")
+        source_transform_path = speakers_dir / f"{source_speaker}.npy"
+        target_transform_path = speakers_dir / f"{target_speaker}.npy"
+        for path in (source_transform_path, target_transform_path):
+            if not path.is_file():
+                raise FileNotFoundError(f"USCF in-domain speaker transform is missing: {path}")
+        source_transform = np.load(source_transform_path)
+        target_transform = np.load(target_transform_path)
+        source_transform_label = str(source_transform_path)
+        target_transform_label = str(target_transform_path)
+    else:
+        assert transforms_file is not None
+        if not transforms_file.is_file():
+            raise FileNotFoundError(f"Packed USCF transforms artifact is missing: {transforms_file}")
+        transforms = np.load(transforms_file, allow_pickle=True).item()
+        if not isinstance(transforms, dict):
+            raise ValueError(f"Packed USCF transforms artifact is not a dictionary: {transforms_file}")
+        missing = [speaker_id for speaker_id in (source_speaker, target_speaker) if speaker_id not in transforms]
+        if missing:
+            raise FileNotFoundError(
+                f"USCF in-domain speaker transform(s) missing from {transforms_file}: {', '.join(missing)}"
+            )
+        source_transform = transforms[source_speaker]
+        target_transform = transforms[target_speaker]
+        source_transform_label = f"{transforms_file}[{source_speaker!r}]"
+        target_transform_label = f"{transforms_file}[{target_speaker!r}]"
 
     content_projection = torch.from_numpy(np.load(content_projection_path)).float().contiguous()
-    target_transform = torch.from_numpy(np.load(target_transform_path)).float().contiguous()
+    target_transform = torch.from_numpy(np.asarray(target_transform)).float().contiguous()
     if content_projection.ndim != 2 or content_projection.shape[0] != features.shape[1]:
         raise ValueError(
             f"USCF content projection {content_projection_path} must have shape "
@@ -199,15 +277,15 @@ def convert_features_uscf(
         "source_speaker": source_speaker,
         "target_speaker": target_speaker,
         "content_projection": str(content_projection_path),
-        "source_transform": str(source_transform_path),
-        "target_transform": str(target_transform_path),
+        "source_transform": source_transform_label,
+        "target_transform": target_transform_label,
     }
 
 
 def load_speaker_embedding_for_librispeech_speaker(
-    audio_path: Path, embedding_dir: Path, feature_source_root: Path
+    audio_path: Path, embedding_dir: Path, feature_source_root: Path, explicit_speaker_id: str | None = None
 ) -> tuple[torch.Tensor, Path]:
-    speaker_id = librispeech_speaker_id(audio_path)
+    speaker_id = speaker_id_for_audio(audio_path, explicit_speaker_id)
     speakers_dir = embedding_dir / "speakers"
     if speakers_dir.is_dir():
         embedding_path = speakers_dir / f"{speaker_id}.npy"
@@ -236,12 +314,49 @@ def load_speaker_embedding_for_librispeech_speaker(
     return embedding, embedding_path
 
 
+def load_speaker_matrix_for_speaker(
+    audio_path: Path, matrix_dir: Path, explicit_speaker_id: str | None = None
+) -> tuple[torch.Tensor, Path]:
+    speaker_id = speaker_id_for_audio(audio_path, explicit_speaker_id)
+    speakers_dir = matrix_dir / "speakers"
+    matrix_path = (speakers_dir if speakers_dir.is_dir() else matrix_dir) / f"{speaker_id}.npy"
+    if not matrix_path.is_file():
+        raise FileNotFoundError(f"Speaker matrix is missing: {matrix_path}")
+    matrix = torch.from_numpy(np.load(matrix_path)).float().contiguous()
+    if tuple(matrix.shape) != (75, 1024):
+        raise ValueError(f"Expected a (75, 1024) speaker matrix in {matrix_path}, got {tuple(matrix.shape)}.")
+    return matrix, matrix_path
+
+
 def align_features(features: torch.Tensor, target_frames: int) -> torch.Tensor:
     if features.size(0) == 0:
         raise ValueError("Feature tensor has no frames.")
     if features.size(0) < target_frames:
         features = torch.cat((features, features[-1:].expand(target_frames - features.size(0), -1)), dim=0)
     return features[:target_frames]
+
+
+def decode_precomputed_features_streaming(
+    model: VocosExp,
+    features: torch.Tensor,
+    chunk_frames: int,
+    speaker_embedding: torch.Tensor | None = None,
+    speaker_matrix: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode all feature frames with one persistent Vocos state per utterance."""
+    if features.ndim != 3 or features.size(-1) == 0:
+        raise ValueError(f"Expected non-empty features of shape (batch, channels, frames), got {tuple(features.shape)}.")
+    state = None
+    chunks = []
+    for start in range(0, features.size(-1), chunk_frames):
+        audio_chunk, state = model.decode_stream(
+            features[..., start : start + chunk_frames],
+            state,
+            speaker_embedding=speaker_embedding,
+            speaker_matrix=speaker_matrix,
+        )
+        chunks.append(audio_chunk)
+    return torch.cat(chunks, dim=-1)
 
 
 def main() -> None:
@@ -271,20 +386,28 @@ def main() -> None:
     features = load_feature_tensor(feature_path)
     uscf_metadata = None
     if args.speaker_transform_dir is not None:
-        features = lift_features_for_librispeech_speaker(features, audio_path, args.speaker_transform_dir)
+        features = lift_features_for_speaker(features, audio_path, args.speaker_transform_dir, args.speaker_id)
     if args.uscf_content_projection is not None:
         features, uscf_metadata = convert_features_uscf(
             features,
             audio_path,
             args.uscf_content_projection,
             args.uscf_transform_dir,
+            args.uscf_transforms_file,
             args.uscf_target_speaker,
+            args.speaker_id,
         )
     speaker_embedding = None
     speaker_embedding_path = None
     if args.speaker_embedding_dir is not None:
         speaker_embedding, speaker_embedding_path = load_speaker_embedding_for_librispeech_speaker(
-            audio_path, args.speaker_embedding_dir, args.feature_source_root
+            audio_path, args.speaker_embedding_dir, args.feature_source_root, args.speaker_id
+        )
+    speaker_matrix = None
+    speaker_matrix_path = None
+    if args.speaker_matrix_dir is not None:
+        speaker_matrix, speaker_matrix_path = load_speaker_matrix_for_speaker(
+            audio_path, args.speaker_matrix_dir, args.speaker_id
         )
     target_frames = math.ceil(source_audio.size(-1) / feature_hop_length)
     features = align_features(features, target_frames)
@@ -304,11 +427,34 @@ def main() -> None:
         return
 
     with torch.inference_mode():
-        prediction = model(
-            source_audio.to(device),
-            precomputed_features=features.transpose(0, 1).unsqueeze(0).to(device),
-            speaker_embedding=None if speaker_embedding is None else speaker_embedding.unsqueeze(0).to(device),
-        )[0].float().cpu().clamp(-1, 1)
+        model_features = features.transpose(0, 1).unsqueeze(0).to(device)
+        model_speaker_embedding = None if speaker_embedding is None else speaker_embedding.unsqueeze(0).to(device)
+        model_speaker_matrix = None if speaker_matrix is None else speaker_matrix.unsqueeze(0).to(device)
+        prediction = decode_precomputed_features_streaming(
+            model,
+            model_features,
+            args.stream_chunk_frames,
+            speaker_embedding=model_speaker_embedding,
+            speaker_matrix=model_speaker_matrix,
+        )
+        verification = None
+        if args.verify_streaming:
+            full_prediction = model(
+                source_audio.to(device),
+                precomputed_features=model_features,
+                speaker_embedding=model_speaker_embedding,
+                speaker_matrix=model_speaker_matrix,
+            )
+            max_abs_error = (prediction - full_prediction).abs().max().item()
+            try:
+                torch.testing.assert_close(prediction, full_prediction, atol=1e-5, rtol=1e-5)
+            except AssertionError as exc:
+                raise RuntimeError(
+                    "Cached streaming Vocos inference did not match full-sequence decoding; "
+                    f"max absolute error={max_abs_error:.8g}."
+                ) from exc
+            verification = {"passed": True, "max_abs_error": max_abs_error}
+        prediction = prediction[0].float().cpu().clamp(-1, 1)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_stem = audio_path.stem
@@ -325,11 +471,17 @@ def main() -> None:
                 "checkpoint": str(checkpoint_path),
                 "speaker_embedding_dir": None if args.speaker_embedding_dir is None else str(args.speaker_embedding_dir),
                 "speaker_embedding": None if speaker_embedding_path is None else str(speaker_embedding_path),
+                "speaker_matrix_dir": None if args.speaker_matrix_dir is None else str(args.speaker_matrix_dir),
+                "speaker_matrix": None if speaker_matrix_path is None else str(speaker_matrix_path),
                 "uscf": uscf_metadata,
                 "prediction": str(output_audio),
                 "sample_rate": sample_rate,
                 "input_samples": source_audio.size(-1),
                 "output_samples": prediction.numel(),
+                "inference_mode": "cached_streaming_vocos",
+                "stream_chunk_frames": args.stream_chunk_frames,
+                "stream_chunk_count": math.ceil(features.size(0) / args.stream_chunk_frames),
+                "streaming_verification": verification,
             },
             indent=2,
         )
