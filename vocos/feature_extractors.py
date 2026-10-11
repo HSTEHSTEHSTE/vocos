@@ -7,8 +7,12 @@ from typing import List
 import numpy as np
 import torch
 import torchaudio
-from encodec import EncodecModel
 from torch import nn
+
+try:
+    from encodec import EncodecModel
+except ImportError:
+    EncodecModel = None
 
 from vocos.modules import safe_log
 
@@ -94,6 +98,11 @@ class EncodecFeatures(FeatureExtractor):
         train_codebooks: bool = False,
     ):
         super().__init__()
+        if EncodecModel is None:
+            raise ImportError(
+                "EncodecFeatures requires the optional 'encodec' dependency. "
+                "It is not needed for precomputed WavLM Vocos inference."
+            )
         if encodec_model == "encodec_24khz":
             encodec = EncodecModel.encodec_model_24khz
         elif encodec_model == "encodec_48khz":
