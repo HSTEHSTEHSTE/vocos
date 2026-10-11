@@ -13,11 +13,31 @@ from torch import nn
 from vocos.modules import safe_log
 
 
-_WAVLM_SOURCE_DIR = Path(__file__).resolve().parents[2] / "unilm" / "wavlm"
-if str(_WAVLM_SOURCE_DIR) not in sys.path:
-    sys.path.insert(0, str(_WAVLM_SOURCE_DIR))
+def _load_official_wavlm_support():
+    """Import the optional official-WavLM helper only when it is actually used.
 
-from official_wavlm import OFFICIAL_WAVLM_LARGE_CHECKPOINT, load_official_wavlm_large
+    Most of the custom Vocos configurations consume precomputed features.  An
+    eager import here made those configurations unusable in a lightweight
+    inference delivery that intentionally did not include the sibling
+    ``unilm/wavlm`` checkout.
+    """
+
+    wavlm_source_dir = Path(__file__).resolve().parents[2] / "unilm" / "wavlm"
+    if not wavlm_source_dir.is_dir():
+        raise ImportError(
+            "WavLMFeatures requires the optional sibling unilm/wavlm checkout. "
+            "Use PrecomputedWavLMFeatures when supplying extracted features."
+        )
+    if str(wavlm_source_dir) not in sys.path:
+        sys.path.insert(0, str(wavlm_source_dir))
+    try:
+        from official_wavlm import OFFICIAL_WAVLM_LARGE_CHECKPOINT, load_official_wavlm_large
+    except ImportError as exc:
+        raise ImportError(
+            "Unable to import the optional official_wavlm helper required by WavLMFeatures. "
+            "Use PrecomputedWavLMFeatures when supplying extracted features."
+        ) from exc
+    return OFFICIAL_WAVLM_LARGE_CHECKPOINT, load_official_wavlm_large
 
 
 class FeatureExtractor(nn.Module):
@@ -128,7 +148,7 @@ class WavLMFeatures(FeatureExtractor):
 
     def __init__(
         self,
-        checkpoint_path: str = str(OFFICIAL_WAVLM_LARGE_CHECKPOINT),
+        checkpoint_path: str | None = None,
         input_sample_rate: int = 16000,
         source_sample_rate: int = 24000,
         output_hop_length: int = 480,
@@ -140,7 +160,9 @@ class WavLMFeatures(FeatureExtractor):
         self.source_sample_rate = source_sample_rate
         self.output_hop_length = output_hop_length
         self.train_wavlm = train_wavlm
-        self.wavlm, config = load_official_wavlm_large(checkpoint_path)
+        default_checkpoint, load_official_wavlm_large = _load_official_wavlm_support()
+        resolved_checkpoint_path = str(default_checkpoint) if checkpoint_path is None else checkpoint_path
+        self.wavlm, config = load_official_wavlm_large(resolved_checkpoint_path)
         self.feature_layer = config.encoder_layers if feature_layer == -1 else feature_layer
         if not 1 <= self.feature_layer <= config.encoder_layers:
             raise ValueError(

@@ -174,6 +174,29 @@ frames, so the conditioning and decoder are both zero-look-ahead.
 the complete utterance. Use `--stream-chunk-frames N` to change the cadence and
 `--verify-streaming` to compare the result against one full-sequence decode.
 
+#### Portable 16 kHz content75 + speaker-lift inference
+
+`infer_content75_lift_vocos.py` is the dependency-light decoder for the 16 kHz,
+320-sample-hop LibriSpeech + Mixer6 checkpoint. It needs neither the sibling
+`unilm/wavlm` checkout nor `official_wavlm`: provide the already-extracted
+content tensor (`[frames, 75]`) and the selected target speaker transform
+(`.npy`, `[75, 1024]`).
+
+```bash
+python infer_content75_lift_vocos.py \
+  --config configs/wavlm-causal-librispeech-mixer6-content75-lift1024.yaml \
+  --checkpoint vocos_content75_lift.ckpt \
+  --feature utterance_content75.pt \
+  --speaker-transform target_75x1024.npy \
+  --output utterance_pred.wav \
+  --device cuda
+```
+
+It preserves causal Vocos state across chunks; use `--device cpu` when no GPU
+is available. Raw-audio-to-content extraction remains a separate deployment
+component because it requires the exact causal WavLM teacher/student stack used
+to create the 75-D features.
+
 #### LinearVC 75-D content-feature toggle
 
 Set `VOCOS_FEATURE_MODE=linearvc_content75` when submitting the causal WavLM
